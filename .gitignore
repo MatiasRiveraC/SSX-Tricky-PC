@@ -44,8 +44,11 @@ dist/
 *.log
 *.bmp
 xbox_kernel.log
-Screenshots/
-"SSX Tricky.ini"
+# The game's F12 screenshots land beside the exe. Anchored: on Windows git
+# ignores case, and a bare "Screenshots/" also swallowed docs/screenshots/.
+/Screenshots/
+/port/build/Screenshots/
+# Settings (SSX Tricky.ini) and other local configuration
 *.ini
 
 # Local only: scratch work, recompiler work dirs, backups, measurement logs

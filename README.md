@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/screenshots/race-pack.jpg" alt="SSX Tricky PC: a race on Garibaldi" width="80%">
+  <img src="docs/screenshots/start-go.jpg" alt="SSX Tricky PC: the start of a race on Garibaldi, at 1080p in widescreen" width="100%">
 </p>
 
 # SSX Tricky: PC Port
@@ -28,18 +28,23 @@ It also adds:
 
 ## Screenshots
 
+All taken of the port at **1920×1080** with **16:9** switched on. The menus keep their original 4:3 layout; races use the game's own widescreen view.
+
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/title.jpg" alt="Title screen"><br><sub><b>Title screen</b></sub></td>
-    <td width="50%"><img src="docs/screenshots/select-mode.jpg" alt="Select Mode"><br><sub><b>Select Mode</b>, the 3D frontend</sub></td>
+    <td width="50%"><img src="docs/screenshots/race-pack.jpg" alt="Racing against the AI riders"><br><sub><b>Garibaldi</b>, racing the AI riders</sub></td>
+    <td width="50%"><img src="docs/screenshots/race-halfpipe.jpg" alt="The halfpipe section"><br><sub><b>The halfpipe</b>, with the speed blur</sub></td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/character-select.jpg" alt="Character select"><br><sub><b>Character select</b></sub></td>
-    <td><img src="docs/screenshots/start-gate.jpg" alt="Start gate"><br><sub><b>The start gate</b>, with the other riders</sub></td>
+    <td><img src="docs/screenshots/race-vista.jpg" alt="Mountain view"><br><sub><b>Out of the halfpipe</b>, the mountain behind</sub></td>
+    <td><img src="docs/screenshots/race-markings.jpg" alt="Red course markings"><br><sub><b>Carving</b> past the course markings</sub></td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/race-chase.jpg" alt="Racing"><br><sub><b>Garibaldi</b>, with the speed blur</sub></td>
-    <td><img src="docs/screenshots/race-markings.jpg" alt="Racing on Garibaldi"><br><sub><b>Garibaldi</b>, mid-race</sub></td>
+    <td><img src="docs/screenshots/title.jpg" alt="Title screen"><br><sub><b>Title screen</b></sub></td>
+    <td><img src="docs/screenshots/select-mode.jpg" alt="Select Mode"><br><sub><b>Select Mode</b>, the 3D frontend</sub></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="docs/screenshots/character-select.jpg" alt="Character select" width="50%"><br><sub><b>Character select</b></sub></td>
   </tr>
 </table>
 
@@ -73,7 +78,7 @@ It also adds:
 
 ## Install and play
 
-1. **Get the program**: download a build from [Releases](https://github.com/MatiasRiveraC/SSX-Tricky-PC/releases) when one is published, or [build it yourself](#building-from-source). A build is `SSX Tricky.exe` plus `libwinpthread-1.dll`, with no game data.
+1. **Download** the latest zip from [**Releases**](https://github.com/MatiasRiveraC/SSX-Tricky-PC/releases/latest) and unzip it into its own folder. It holds `SSX Tricky.exe` and `libwinpthread-1.dll`, and no game data. (Or [build it yourself](#building-from-source).)
 2. **Make a disc image** of your Xbox game disc, as an `.iso`.
 3. **Open `SSX Tricky.exe`**. The launcher opens with **Start game**, **Settings** and **Exit**.
 4. In **Settings**:
@@ -134,8 +139,8 @@ There is no language option: the game always uses its American text, and the USA
 
 **Known differences from the Xbox** (being worked on):
 
-- Some surfaces in the middle distance flicker or speckle. The game uses a *w-buffer* for depth in races, which the renderer does not reproduce yet.
-- Fog and snow-spray particles are weaker than on the console.
+- **Distant fog is too weak.** Far-away terrain is barely fogged, where the console fades it into the sky colour. Without the fog, ground right at the edge of the view distance can look speckled. This is what makes some surfaces look wrong at a distance and right up close.
+- Some particle effects (snow spray, trails) are smaller or dimmer than on the console.
 - In the frontend, some lit floors are darker than on the console, and the board is not shown beside the rider on the setup screen.
 - Other courses, the other modes, and the end of a race are untested.
 
@@ -186,8 +191,8 @@ cmake --build port/build -j
 ## Troubleshooting
 
 - **Start game stays greyed out.** Set a disc image in **Settings**. Only the **USA Xbox** release is supported, and the image must be the full disc.
-- **Windows says `XINPUT1_3.dll` is missing.** Install the [DirectX End-User Runtime](https://www.microsoft.com/download/details.aspx?id=35).
-- **Windows says `libwinpthread-1.dll` is missing.** Keep the DLL from the build folder next to `SSX Tricky.exe`.
+- **Windows says `libwinpthread-1.dll` is missing.** Keep the DLL from the zip in the same folder as `SSX Tricky.exe`.
+- **Windows SmartScreen warns about the exe.** The build isn't code-signed. Choose **More info → Run anyway** if you trust the download.
 - **The game closed unexpectedly.** Tick **Write a log file** in Settings, reproduce it, and attach `SSX Tricky.log` when you report the problem.
 - **Something is drawn wrong.** Press `F12` for a screenshot and report it with the log, and say where in the game it was.
 

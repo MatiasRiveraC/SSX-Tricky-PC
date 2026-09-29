@@ -221,6 +221,7 @@ static struct {
      * program's oPts.x, otherwise SET_POINT_SIZE / 8; SET_POINT_SMOOTH_ENABLE
      * makes them sprites whose stage-3 coordinate runs 0..1 across the square. */
     int      point_params_enable, point_smooth;
+    float    point_params[8];       /* SET_POINT_PARAMS 0x0A30..0x0A4C */
     uint32_t point_size;
     int      specular_enable;       /* SET_SPECULAR_ENABLE: oD1 reaches the combiners */
     /* Stencil, face culling (part 182). GL enums as the push buffer sends
@@ -1580,10 +1581,10 @@ static void drawlog_program_draw(const uint32_t *indices, uint32_t v0, uint32_t 
             }
         }
     }
-    fprintf(stderr, "[DRAW]   oD0 %.3g %.3g %.3g %.3g oD1 %.3g %.3g %.3g %.3g oFog %.3g pos %.1f %.1f %.4f %.3g\n",
+    fprintf(stderr, "[DRAW]   oD0 %.3g %.3g %.3g %.3g oD1 %.3g %.3g %.3g %.3g oFog %.3g oPts %.4g pos %.1f %.1f %.4f %.3g\n",
             out[VSHCPU_OUT_D0][0], out[VSHCPU_OUT_D0][1], out[VSHCPU_OUT_D0][2], out[VSHCPU_OUT_D0][3],
             out[VSHCPU_OUT_D1][0], out[VSHCPU_OUT_D1][1], out[VSHCPU_OUT_D1][2], out[VSHCPU_OUT_D1][3],
-            out[VSHCPU_OUT_FOG][0], out[VSHCPU_OUT_POS][0], out[VSHCPU_OUT_POS][1],
+            out[VSHCPU_OUT_FOG][0], out[VSHCPU_OUT_PTS][0], out[VSHCPU_OUT_POS][0], out[VSHCPU_OUT_POS][1],
             out[VSHCPU_OUT_POS][2], out[VSHCPU_OUT_POS][3]);
 }
 
@@ -1953,7 +1954,13 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             lo = e ? atoi(e) : -1;
             if (e && strchr(e, ':')) n_frames = atoi(strchr(e, ':') + 1);
         }
-        if (lo >= 0 && (int)d3d8_PresentSeq() >= lo && (int)d3d8_PresentSeq() < lo + n_frames)
+        static int only_mode = -2;
+        if (only_mode == -2) {   /* XBOX_NV2A_DRAWLOG_MODE=N: only draws of that primitive mode */
+            const char *e = getenv("XBOX_NV2A_DRAWLOG_MODE");
+            only_mode = e ? atoi(e) : -1;
+        }
+        if (lo >= 0 && (int)d3d8_PresentSeq() >= lo && (int)d3d8_PresentSeq() < lo + n_frames &&
+            (only_mode < 0 || (int)g_pg.draw_mode == only_mode))
             drawlog_program_draw(indices, indices ? indices[0] : start, count);
     }
     {
@@ -2005,6 +2012,55 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         prim = D3DPT_TRIANGLELIST;
     } else {
         n = assemble(g_pg.draw_mode, vb, okb, count, tb, &prim);
+    }
+    {
+        /* XBOX_NV2A_PRIMLOG=1 (diagnostic): every 5 s, the non-triangle
+         * program draws -- mode, texture, blend, point size -- grouped. */
+        static int on = -1;
+        static struct { uint32_t key[4]; unsigned n, verts; float smin, smax, ssum; float pp[8]; } g[64];
+        static int ng;
+        static DWORD last;
+        if (on < 0) { const char *e = getenv("XBOX_NV2A_PRIMLOG"); on = e && e[0] == '1'; }
+        if (on && g_pg.draw_mode >= 1 && g_pg.draw_mode <= 4) {
+            uint32_t key[4];
+            int k;
+            key[0] = g_pg.draw_mode | (g_pg.point_params_enable << 8) | (g_pg.point_smooth << 9);
+            key[1] = g_pg.tex[3].enabled ? g_pg.tex[3].offset : g_pg.tex[0].enabled ? g_pg.tex[0].offset : 0;
+            key[2] = g_pg.tex[3].enabled ? g_pg.tex[3].format : g_pg.tex[0].enabled ? g_pg.tex[0].format : 0;
+            key[3] = (g_pg.blend_enable ? 0x80000000u : 0) | (g_pg.blend_sfactor << 16) | g_pg.blend_dfactor;
+            for (k = 0; k < ng; k++)
+                if (!memcmp(g[k].key, key, sizeof key)) break;
+            if (k == ng && ng < 64) {
+                memset(&g[ng], 0, sizeof g[ng]);
+                memcpy(g[ng].key, key, sizeof key); g[ng].smin = 1e30f; g[ng].smax = -1e30f;
+                memcpy(g[ng].pp, g_pg.point_params, sizeof g[ng].pp);
+                ng++;
+            }
+            if (k < ng) {
+                uint32_t v;
+                g[k].n++; g[k].verts += count;
+                for (v = 0; points && v < count; v++) {
+                    float s = psb[v];
+                    if (s < g[k].smin) g[k].smin = s;
+                    if (s > g[k].smax) g[k].smax = s;
+                    g[k].ssum += s;
+                }
+            }
+        }
+        if (on && GetTickCount() - last > 5000) {
+            int k;
+            last = GetTickCount();
+            fprintf(stderr, "[PRIMLOG] present %u, %d groups\n", d3d8_PresentSeq(), ng);
+            for (k = 0; k < ng; k++)
+                fprintf(stderr, "[PRIMLOG]   mode %u params %u smooth %u tex %08X fmt %08X blend %08X: %u draws %u verts size %.2f..%.2f\n",
+                        g[k].key[0] & 0xFF, (g[k].key[0] >> 8) & 1, (g[k].key[0] >> 9) & 1, g[k].key[1], g[k].key[2],
+                        g[k].key[3], g[k].n, g[k].verts, g[k].smin, g[k].smax);
+            for (k = 0; k < ng; k++)
+                fprintf(stderr, "[PRIMLOG]   group %d: mean size %.2f, point params %g %g %g %g %g %g %g %g, POINT_SIZE %u\n",
+                        k, g[k].verts ? g[k].ssum / g[k].verts : 0.0f, g[k].pp[0], g[k].pp[1], g[k].pp[2],
+                        g[k].pp[3], g[k].pp[4], g[k].pp[5], g[k].pp[6], g[k].pp[7], g_pg.point_size);
+            ng = 0;
+        }
     }
     {
         /* XBOX_NV2A_PICK=x,y (diagnostic): name every program draw whose
@@ -3128,6 +3184,12 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         return 1;
     case NV097_SET_POINT_SIZE:
         if (param <= 0x1FF) g_pg.point_size = param;
+        return 1;
+    case NV097_SET_POINT_PARAMS + 0x00: case NV097_SET_POINT_PARAMS + 0x04:
+    case NV097_SET_POINT_PARAMS + 0x08: case NV097_SET_POINT_PARAMS + 0x0C:
+    case NV097_SET_POINT_PARAMS + 0x10: case NV097_SET_POINT_PARAMS + 0x14:
+    case NV097_SET_POINT_PARAMS + 0x18: case NV097_SET_POINT_PARAMS + 0x1C:
+        memcpy(&g_pg.point_params[(method - NV097_SET_POINT_PARAMS) / 4], &param, 4);
         return 1;
 
     case NV097_SET_WINDOW_CLIP_TYPE:

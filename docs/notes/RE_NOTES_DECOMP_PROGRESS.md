@@ -10097,3 +10097,54 @@ game dying at its hard-disk check. `tools/audit/stale.py`
 **Diagnostics** (tools/audit/README.md): `XBOX_FPS_LOG`, `XBOX_PROFILE` (+
 `profsum.py`), `XBOX_WAIT_LOG=N`, `XBOX_TIMER_LOG=2`, `XBOX_FLIP_LOG`,
 `XBOX_READ_STATS` (+ `frametimeline.py`).
+
+### Part 183, continued -- _ftol never popped, and the distant-texture report
+
+**`CRT_ftol_TruncateToInt64` (0x0015CA68) left its argument on the x87
+stack.** The helper converts ST(0) through its own private stack
+(`g_ftol_fp_stack`, seeded from `g_ftol_arg`) and never popped the caller's
+shared one (`g_fp_stack`), where the real `_ftol` pops. Every one of the 539
+call sites therefore left one value behind. Harmless in code that discards
+the stack; wrong in code that keeps values there across the call. The course
+tessellator `sub_000F8920` (called from `sub_000F8A30` <-
+`BoardMesh_DrawAttachedPatches`, every frame) keeps u/v in ST(0)/ST(1) across
+three ftol calls, so its lerp started from the last two ftol arguments -- the
+lightmap step (256, 0) -- and wrote texture coordinates of 256.143 next to
+0.143: the snow tiled 256 times across a triangle (the moire on every course
+surface) and the red markings became fine concentric lines. Found by dumping
+the terrain vertices (`XBOX_NV2A_DRAWLOG_VERTS`) and write-watching one
+texcoord (`XBOX_DIAG_WATCH=234818C:4`). Fix: `g_fp_top++` in the helper's
+entry, which covers the `fp_top()` sites, the `g_x87_st0` sites (their callee
+pushed the value) and the tail-jump sites. Also fixed by it: the AI riders
+race (positions change; the player was always "1st"), and the speed blur
+appears. menucheck PASS, race 60 fps.
+
+**"Textures wrong at a distance, fine up close" (user report).** Ruled out:
+mip data (every level of the race's DXT1/DXT3/R5G6B5 textures decoded from a
+RAM dump is correct -- tools: `savemem.py`, `XBOX_TEXUP_LOG`, a mip-sheet
+decoder), LOD bias/clamps (same as xemu), and the w-buffer (CONTROL0 is
+`00110001` only during start-up; races run `00100001`, a fixed-point
+z-buffer). The texture modes in use are all 2D (`XBOX_NV2A_TEXSTATS`): no
+cube maps anywhere from boot to the race. What it is: **distant fog is ~10x
+too weak.** The terrain program (C1E8DC9E) computes its own exp2 fog into
+oT3.w, `2^-(dot(pos, v9) * c99.w)^2`, with `v9` a per-object constant
+attribute (like the matrix in v11-v14), and the final combiner lerps to the
+fog colour c98 (192,192,224) by T3.a. At an eye depth of 18,800 ours gives
+0.976 (unfogged); xemu shows the valley at the fog colour. The far valley
+also sits on the far plane (z 0.999-1.007), so without fog it speckles
+between drawn and clipped pixels. Next: trace where v9 / c99.w are computed
+-- CPU-side game math, the likeliest place for another translation bug.
+
+Particles: the 160-point trails (additive, stage-3 sprite texture) take their
+size from the program (`max(..., 1)` px, 1-3 px); `SET_POINT_PARAMS` is now
+recorded (A = (64/480)^2, scale 64) but, as in xemu, not applied to program
+sizes -- the missing mist is not these sprites.
+
+Diagnostics added (all off by default): `XBOX_NV2A_TEXSTATS`, `XBOX_TEXUP_LOG`,
+`XBOX_NV2A_PRIMLOG`, `XBOX_NV2A_DRAWLOG_MODE=N`, `XBOX_NV2A_DRAWLOG_VERTS=N`
+(now with constant registers), and XBOX_NV2A_PICK works on the GPU path by
+taking the CPU path in the DRAWLOG frames.
+
+**Release build:** MinGW's `xinput` import library is XInput 1.3, missing on
+stock Windows 10/11; linked `xinput1_4` instead (xboxrecomp/src/input and the
+port's CMakeLists).

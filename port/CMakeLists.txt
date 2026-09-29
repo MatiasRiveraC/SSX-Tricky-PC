@@ -77,7 +77,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
     dxgi
     dxguid
-    xinput
+    $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # XInput 1.4 ships with Windows
     winmm
     # Launcher and menu bar: themed controls, file/folder pickers, shell
     comctl32
