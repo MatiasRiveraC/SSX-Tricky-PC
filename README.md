@@ -78,7 +78,7 @@ All taken of the port at **1920×1080** with **16:9** switched on. The menus kee
 
 ## Install and play
 
-1. **Download** the latest zip from [**Releases**](https://github.com/MatiasRiveraC/SSX-Tricky-PC/releases/latest) and unzip it into its own folder. It holds `SSX Tricky.exe` and `libwinpthread-1.dll`, and no game data. (Or [build it yourself](#building-from-source).)
+1. **Download** `SSX-Tricky-PC-…-win64.7z` from [**Releases**](https://github.com/MatiasRiveraC/SSX-Tricky-PC/releases/latest) and extract it into its own folder (Windows 11 opens `.7z` files directly; on Windows 10 use [7-Zip](https://www.7-zip.org/)). It holds `SSX Tricky.exe` and `libwinpthread-1.dll`, and no game data. (Or [build it yourself](#building-from-source).)
 2. **Make a disc image** of your Xbox game disc, as an `.iso`.
 3. **Open `SSX Tricky.exe`**. The launcher opens with **Start game**, **Settings** and **Exit**.
 4. In **Settings**:
