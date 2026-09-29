@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/screenshots/start-go.jpg" alt="SSX Tricky PC: the start of a race on Garibaldi, at 1080p in widescreen" width="100%">
+  <img src="docs/screenshots/title.jpg" alt="SSX Tricky PC: the start of a race on Garibaldi, at 1080p in widescreen" width="100%">
 </p>
 
 # SSX Tricky: PC Port
