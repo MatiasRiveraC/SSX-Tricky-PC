@@ -50,6 +50,7 @@ boundary, not an opcode.
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -58,7 +59,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 
 BSF_REG = re.compile(r"^(?P<ind>\s*)/\* TODO: bsf (?P<dst>e[a-z]{2}), (?P<src>e[a-z]{2}) \*/\s*$")
 BSF_MEM = re.compile(r"^(?P<ind>\s*)/\* TODO: bsf (?P<dst>e[a-z]{2}), "

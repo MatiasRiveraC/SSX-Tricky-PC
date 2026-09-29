@@ -1,0 +1,63 @@
+# ── Game material: never in this repository. Players supply their own disc. ──
+game_files/
+Game Data/
+*.iso
+*.xiso
+*.xbe
+*.xbx
+*.ssx
+*.big
+*.loc
+*.mpc
+hdd/
+TDATA/
+UDATA/
+# Xbox BIOS / boot ROM / EEPROM / HDD images used by emulators
+*.bin
+*.qcow2
+*.toml
+
+# Translated game code: generated from your own XBE (docs/building.md)
+port/src/recomp/gen/
+port/src/recomp/gen.*/
+port/src/recomp/recomp_funcs.h
+xboxrecomp/src/game/
+xboxrecomp/tools/disasm/output/
+xboxrecomp/tools/func_id/output/
+xboxrecomp/tools/recomp/output/
+xboxrecomp/tools/abi_analysis/output/
+xboxrecomp/tools/split/output/
+xboxrecomp_output/
+
+# Builds, packages, runs, logs, captures
+build/
+dist/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+*.ilk
+*.exp
+*.log
+*.bmp
+xbox_kernel.log
+Screenshots/
+"SSX Tricky.ini"
+*.ini
+
+# Local only: scratch work, recompiler work dirs, backups, measurement logs
+_local/
+recover_batches/
+measurements.jsonl
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+xboxrecomp/tools/audit/xemu/shots/
+xboxrecomp/tools/audit/xemu/xemu.toml

@@ -20,9 +20,10 @@ into their caller) and by innermost function. Resolve a log against the
 executable that wrote it: after a rebuild the offsets name other functions.
 """
 import collections, os, re, subprocess, sys
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXE = os.path.normpath(os.path.join(HERE, "../../../ssx_recomp/build/SSX Tricky.exe"))
+EXE = ssxpaths.GAME_EXE
 A2L = os.environ.get("ADDR2LINE", r"C:/Program Files/msys64/ucrt64/bin/addr2line.exe")
 IMAGE_BASE = 0x140000000
 

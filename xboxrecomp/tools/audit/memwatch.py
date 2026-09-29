@@ -28,6 +28,7 @@ rise with flat private bytes means a write sweep, not a leak.
 """
 
 import argparse
+import ssxpaths
 import ctypes
 import ctypes.wintypes as wt
 import os
@@ -38,7 +39,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-GAME = os.path.join(ROOT, "ssx_recomp", "build", "SSX Tricky.exe")
+GAME = ssxpaths.GAME_EXE
 
 
 class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):

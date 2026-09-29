@@ -26,10 +26,11 @@ MAX_DIFF mean absolute difference on a 160x120 grayscale thumbnail.
                                  # (only from a build you have looked at)
 """
 import argparse, glob, os, shutil, subprocess, sys, tempfile
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
-BUILD = os.path.join(ROOT, "ssx_recomp", "build")
+BUILD = ssxpaths.BUILD
 EXE = os.path.join(BUILD, "SSX Tricky.exe")
 REFS = os.path.join(HERE, "menucheck_ref")
 PRESSES = "START@11,START@14,A@18+1.5x16"

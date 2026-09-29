@@ -46,6 +46,7 @@ producers must get the right comparison from each.
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -54,7 +55,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 
 FUNC = re.compile(r"^void ([A-Za-z_][A-Za-z0-9_]*)\(void\)$")
 DECL = re.compile(r"^\s*int _flags = 0; /\* fallback flag var \*/\s*$")

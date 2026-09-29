@@ -44,13 +44,14 @@ are reported, not guessed at.
 """
 
 import argparse
+import ssxpaths
 import os
 import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 
 # A whole line that is nothing but the annotation.
 LINE = re.compile(r"^(?P<ind>\s*)/\* FPU: (?P<mn>[a-z0-9]+)\s*(?P<ops>[^*]*?)\s*\*/\s*$")

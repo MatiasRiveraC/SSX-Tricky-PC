@@ -22,10 +22,11 @@ automatically; run it by hand only after hand-editing a generated file.
 """
 
 import io, re, sys, os
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-GEN  = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
+GEN  = ssxpaths.GEN
 LABEL = re.compile(r"^(loc_([0-9A-Fa-f]{8})): ;[ \t]*$")
 
 def instrument(path):

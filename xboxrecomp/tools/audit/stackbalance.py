@@ -33,6 +33,7 @@ they belong to the callee's `ret N`.
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -41,7 +42,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 
 FUNC = re.compile(r"^void (?P<name>[A-Za-z_][A-Za-z0-9_]*)\(void\)$")
 PUSH = re.compile(r"^\s*PUSH32\(esp, (?P<what>[^)]*)\);\s*$")

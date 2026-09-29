@@ -38,6 +38,7 @@ st(i)` means `st(i), st`.
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -48,9 +49,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 DEFAULT_XBE = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "game", "default.xbe"))
+    ssxpaths.XBE)
 
 FUNC = re.compile(r"^void (?P<name>[A-Za-z_][A-Za-z0-9_]*)\(void\)$")
 ORIGIN = re.compile(r"^\s*\*\s*Original:\s*0x(?P<start>[0-9A-Fa-f]{8})\s*-\s*"

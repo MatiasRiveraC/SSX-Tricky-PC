@@ -15,9 +15,10 @@ in the others `ebp` is not in scope.
     fixebppublish.py [--dry-run]
 """
 import argparse, glob, io, os, re
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GEN = os.path.normpath(os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+GEN = ssxpaths.GEN
 FN = re.compile(r"^(?:static\s+)?void (\w+)\(void\)\s*$")
 CALL = re.compile(r"^(\s*(?:\{ uint32_t _icall_esp = g_esp;\s*)?)(PUSH32\(esp, 0\); (?:\w+\(\)|RECOMP_ICALL))")
 

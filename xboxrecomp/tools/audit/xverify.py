@@ -31,6 +31,7 @@ functions are worth that attention.
 """
 
 import argparse
+import ssxpaths
 import io
 import json
 import os
@@ -43,8 +44,8 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 
-DEFAULT_GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
-DEFAULT_XBE = os.path.join(ROOT, "Game Data", "default.xbe")
+DEFAULT_GEN = ssxpaths.GEN
+DEFAULT_XBE = ssxpaths.XBE
 
 # A line whose entire content is an instruction annotation: the recompiler had
 # something to say about this instruction but emitted no code for it.

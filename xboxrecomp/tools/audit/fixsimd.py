@@ -45,6 +45,7 @@ MMX is handled too, against the lane model added to `recomp_types.h`:
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -53,7 +54,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 
 STORE = re.compile(r"^(?P<ind>\s*)/\* TODO: movntps xmmword ptr \[(?P<addr>[^\]]+)\],"
                    r"\s*(?P<src>xmm[0-7]) \*/\s*$")

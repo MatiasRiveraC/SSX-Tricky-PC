@@ -26,6 +26,7 @@ every write made through a register-held pointer.  The watch finds all of them.
 Requires XBOX_DIAG_PORT to be set for the game process; --launch does that.
 """
 import argparse
+import ssxpaths
 import os
 import re
 import socket
@@ -36,7 +37,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-GAME = os.path.join(ROOT, "ssx_recomp", "build", "SSX Tricky.exe")
+GAME = ssxpaths.GAME_EXE
 DEFAULT_PORT = 4501
 
 

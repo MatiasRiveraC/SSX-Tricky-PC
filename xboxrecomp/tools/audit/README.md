@@ -114,3 +114,19 @@ then from the hitches (`,stall` + the timeline): in part 183 the average
 said "CPU-bound vertex programs" and the hitches said "a dropped ring tail",
 and both were true.
 
+
+## Layout: `ssxpaths.py`
+
+Every tool here finds the game, the generated code, the build and the notes
+through `ssxpaths.py`, which recognises both the SSX-Tricky-PC repository
+(`port/`, `game_files/`, `docs/notes/`, scratch in `_local/`) and the original
+working tree (`ssx_recomp/`, `Game Data/`, `RE_NOTES/`). A new tool should do
+the same instead of spelling a path out.
+
+## Looking at the game: `walkcap.py`, `xemucompare.py`
+
+`walkcap.py OUT SECONDS --direct` walks into a Garibaldi race with scripted
+presses and dumps frames (`FROM`, `EVERY`, `COUNT`); `xemucompare.py OUT.png
+OUT` puts our closest frame beside each xemu reference screenshot. Together
+they are the visual regression check for anything menucheck.py cannot see
+(the race, fog, particles, textures at a distance).

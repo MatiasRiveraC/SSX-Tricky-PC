@@ -1,0 +1,469 @@
+{
+  "0x00000000": {
+    "action": "same subsystem as the menu text; look at it alongside the UI_BuildButtonGroup spin",
+    "evidence": "part 146, found with XBOX_D3D_DUMP_ONCHANGE. The atlas is loaded correctly and the text path works -- the 'loading...' string renders properly on top of the atlas frame -- so it is a texture-stage binding that was not what the background draw expected",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "periodic render glitch: every 249 presents (4.15 s) one frame is presented black, and the first occurrence (present 1496) drew the font atlas full-screen instead of the loading-screen background"
+  },
+  "0x00000001": {
+    "action": "corrected: draws DO land. XBOX_TEST_CLEAR=1 lands teal, so the RTV->backbuffer->present->readback chain is sound, and XBOX_TEST_NOBLEND=1 (added part 160) makes white pixels appear -- so geometry, viewport, RTV, shaders and input layout are all correct. The black screen is a BLENDING/ALPHA problem, not 'no draw lands'. That corrects the standing comment in nv2a_live_pb.c.",
+    "evidence": "part 159: with XBOX_TEST_QUAD=1 the known-good magenta quad drawn immediately before d3d8_PresentFrame does not appear; dumps read mean brightness 0.6 with only (0,0,0), (34,34,34), (17,17,17). The dump is taken BEFORE Present (correct for DXGI_SWAP_EFFECT_DISCARD, see d3d8_device.c:293), so it is not a flip-model sampling error. nv2a_live_pb.c already carries a comment recording this as investigated and unresolved.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "presented back buffer is near-black even with XBOX_TEST_QUAD=1 -- the push-buffer translator's draws do not land"
+  },
+  "0x00000002": {
+    "action": "WRONG -- retracted. There is no alpha bug. Looking at a converted frame instead of its statistics shows 'Autoloading from hard disk' in clean white text: the pipeline renders correctly and the frame is dark because the game is showing a black loading screen. The real gap is that the video player writes decoded pixels straight into guest VRAM (0xF3BA0000/0xF3CCC000), which the host swap chain never displays.",
+    "evidence": "part 160: with blending forced off, 42-70 sampled pixels read pure white; with blending on the same frames are black. All state is verified correct via the built-in draw audit (rtv=back buffer, viewport 0,0 640x480, depth off, cull none, topology 5, stride 28, rtwritemask 0xF) and textures upload with real content (means 27.9-122.6). Pure white output also means the PS texture-stage loop breaks immediately -- StageColor[0].x is <= 1 (D3DTOP_DISABLE) -- so the result is just input.diffuse.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "every draw is invisible under SRCALPHA/INVSRCALPHA: the pixel shader's output alpha is 0"
+  },
+  "0x00000003": {
+    "action": "fixed in part 160 by giving the compiled path the same logic; it is correct but currently invisible because the alpha problem still swallows every draw.",
+    "evidence": "part 160: the compiled generic path did SetTexture(dev,0,NULL) unconditionally with the comment 'use vertex color only', so every translated draw was flat vertex colour. apply_draw_state in the same file already had the correct tex_upload + MODULATE logic.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "submit_draw never bound a texture: the lookup was behind #ifdef GAME_HAS_FONT_ATLAS, a macro defined nowhere"
+  },
+  "0x00000004": {
+    "action": "fixed with per-buffer generation stamps plus a refusal to show a frame older than one already shown; hold re-presents the staging copy. NOT verified fixed: the hash-based metric counts identical-looking new frames as glitches, so it cannot settle it. Needs a within-frame tearing detector.",
+    "evidence": "part 173: 60 consecutive presents hashed showed 7 already-superseded frames reappearing. Cause was picking 'whichever buffer is stable' without comparing which is newer -- with video at ~30fps and presents at ~37 both buffers are often idle.",
+    "part": "",
+    "recorded": "2026-09-04",
+    "status": "noted",
+    "summary": "video frame ordering: display could step backwards ~12% of presents"
+  },
+  "0x000151F0": {
+    "action": "stale trap, cleared part 166: the audio streaming thread now runs clean. Re-tested 3/3 with XBOX_DISPATCH_ALLOW=000151F0 -- exit 124, no crash, no bugcheck, draws ~7,800 -- so the IRQL 0x0A bugcheck that put it here was fixed by work elsewhere in this session. Removed from the built-in deny list in recomp_dispatch.c; 3/3 clean with it on by default.",
+    "evidence": "part 157e re-test: XBOX_DISPATCH_ALLOW=000151F0 gives exit 10, draws 6820, KeBugCheck code=0x0A. The 'last guest label loc_000B2430' in that report is incidental -- probing shows 0x000B2430 is a routine per-frame check that reads [0x1E3DD8]==0 and returns immediately, NOT the abort screen firing.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "still defective: with it allowed the run bugchecks 0x0000000A (IRQL) after ~6800 draws"
+  },
+  "0x00018430": {
+    "action": "translator now takes flags from real predecessors (_incoming_flag_states)",
+    "evidence": "probe at 0x19040 when [esp+0x10]<0x200000: count=0x0072C710 dest=0",
+    "part": "178",
+    "recorded": "2026-09-27",
+    "status": "resolved",
+    "summary": "EA stream mixer: je at 0x184C5 was lifted as 'esp == 0' (flags from the address-order previous block, which ends in jmp); zero-length decodes were never skipped and the converter ran with dest=NULL, count=pointer, writing samples from VA 0 across .text/thunk table/.data"
+  },
+  "0x00019040": {
+    "action": "fixed by add_origin_headers.py + fixfpmem.py over recomp_recovered.c and the part-177/178 flag rollout",
+    "evidence": "XBOX_DIAG_WATCH=FB030:4 caught it writing .text; xverify-style disasm of 0x19075..0x190A5",
+    "part": "178",
+    "recorded": "2026-09-27",
+    "status": "resolved",
+    "summary": "EA float-to-PCM stream converter: fadd [0x1A9F3C] was collapsed to a register pop-add (recovered bodies skipped fixfpmem) and cmp/sbb had no _cf, so every sample saturated to -32768"
+  },
+  "0x0001AC10": {
+    "action": "none -- recovered",
+    "evidence": "part 145: it is miss #11, the last real address before the cascade; recovering it took the tree from 1/3 to 3/3 clean",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "resolved",
+    "summary": "vtable slot 0 called from sub_000181F2; an unregistered target whose ICALL miss started the whole garbage-target cascade (esi left wrong, so sub_0014B570's callback table walk read arbitrary memory and called ~190 junk addresses a run)"
+  },
+  "0x0004C140": {
+    "action": "Same x87 lifter fix.",
+    "evidence": "",
+    "part": "177",
+    "recorded": "2026-09-26",
+    "status": "bad-body",
+    "summary": "Recovered: fcomp [m] compares ST1 and never pops, fnstsw is a comment, jp hard-coded if(1)"
+  },
+  "0x0007C970": {
+    "action": "see 0x000AA1A0 -- unstick the pump's tail",
+    "evidence": "part 150: a guarded probe at the pump's render site for app->4 != 0x007681F0 never fired in 35 s",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "corrected: QueueBootVideos is never called because Application_RunInitialLoadPump is entered once and never returns, so the outer state loop never installs the intro object as app->4. Part 149 blamed reassignment inside FEInit_Boot -- that was wrong"
+  },
+  "0x0007CBD0": {
+    "action": "find what should be ticking app->0x730 each frame and why the intro object is not in that list",
+    "evidence": "part 147: app state 0x1DF3F4 = 2 from t~8s; app->0x730 = 0x006E3300 with vtable 0x00196960; this[7] = 0. Main thread is alive in the widget walk sub_00082D40 -> sub_00082D50, so the frame loop runs -- the object is just not in what it walks",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "TitleIntroSequence_Tick is never called. The intro/FrontEnd object is constructed (sub_0007D7B0), registers itself at app->0x730, FEInit_Boot runs once and every frontend asset loads -- then nothing drives it: Tick, Render, IsComplete and CheckLoaderReady all show 0 calls over a 40 s run"
+  },
+  "0x0007CF76": {
+    "action": "probe esp around each of its callees in one run: sub_00082AE0, sub_000844C0, NodeRegistry_TickAllOfType, sub_00082A50, sub_000A3920, and the ICALL through [edx+0x34].",
+    "evidence": "part 157: esp traced correct into it (0x0423FF04) and its own epilogue pops ebp/edi/esi/ebx/ecx + esp+=4, balanced. TitleIntroSequence_Render is entered with ecx=0x006E3300, the intro object.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "esi/esp lost somewhere in its callee chain, on the intro-sequence render path"
+  },
+  "0x0007E7A0": {
+    "action": "",
+    "evidence": "",
+    "part": "127",
+    "recorded": "2026-09-02",
+    "status": "noted",
+    "summary": "slot +0x00 of the intro vtable 0x00196960, not registered"
+  },
+  "0x00082D30": {
+    "action": "AddChild (widget vt[0xA0]); trapped in error since part 127 -- the recursion blamed on it came from sibling functions the batch pulled in, not from this body. It is 'add ecx,0xF8; jmp 0xA39E0' into an already-correct insert. Recovered part 156.",
+    "evidence": "a real widget-tree defect, not a translation bug",
+    "part": "",
+    "recorded": "2026-09-02",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "causes infinite mutual recursion 0x000A3A60 -> 0x000A38F0 -> 0x000A38F0 -> 0x00085820"
+  },
+  "0x000841F0": {
+    "action": "find why the title-screen widget has no children at +0xF8 when sub_00087350 runs",
+    "evidence": "part 152: sub_00082D50 probed with esi=0 on every entry; main_loc frozen at loc_0009998B while last_loc cycles the walk, and none of the walk functions stamp main_loc",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "calls sub_000A3900 ('first child, or NULL for an empty list') and dereferences the result immediately at 0x84224 with no null check. On hardware that faults; the game never expects the list empty. The null-page redirect converts it into an endless walk over node 0, which is why it presents as a hang"
+  },
+  "0x000855B0": {
+    "action": "same class as the AddChild blocker: dump the list at intro+0xC4 and find why sub_000A3A00 never sees end-of-list. Check whether anything populates it.",
+    "evidence": "part 157: probing all 32 labels of sub_0007CF76 in one run shows control reach loc_0007D0D0, call sub_000855B0, and never reach loc_0007D0DB or the epilogue at loc_0007D0ED -- so the pump's frame is never unwound and esi/esp stay corrupted. esp is correct (0x0423FF00) right up to the call. ecx = intro_object + 0xA0 = 0x006E33A0.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "never returns: tail-jumps to the list walk 0x000A3A00 over the intro object's list at +0xC4, which does not terminate"
+  },
+  "0x000871A0": {
+    "action": "find what should populate it -- UI_BuildButtonGroup (0x00086170) runs on the screen and attaches nothing",
+    "evidence": "part 154: looping widget 0x021C87C0 = [screen+0x34]; list head 0x021C88CC with [head+0xC]==head; a probe guarded on sub_000A3BB0(ecx==0x021C87C0) never fired; write-watch on the wrap byte names sub_00083520 via UI_BuildListWidget_Alt",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "UI_BuildListWidget_Alt creates the title screen's f3wlst list widget with wrap-around enabled (+0x138 = 1) and it never receives any items. A widget with wrap on and an empty child list makes the layout walk sub_00082D50 loop forever by construction, which is why FEInit_Boot never returns and the intro videos are never queued"
+  },
+  "0x00087350": {
+    "action": "stale: it spun because AddChild (0x00082D30) was trapped, so every widget child list was empty. With AddChild recovered in part 156 this function returns and FEInit_Boot completes.",
+    "evidence": "part 151: diag 'loc' shows main_loc static at loc_0009998B while last_loc cycles loc_00082D50..loc_000A3900, 32 of 40 samples moving",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "never returns: a widget-layout function called from sub_00099867 at 0x0009998D, inside UI_BuildTitleHelp's chain. The widget list walk sub_00082D50 -> sub_000A3890/sub_000A3900 spins inside it forever, so FEInit_Boot never returns and the load pump never gets past the intro state's init -- which is why the boot videos are never queued"
+  },
+  "0x000A3730": {
+    "action": "remaining: green channel reads zero (magenta image), block artifacts, and the framebuffer address still comes from an env var because the NV2A PCRTC scanout register reads zero.",
+    "evidence": "part 162: with XBOX_GUEST_FB=0xF3BA0000 the guest framebuffer is uploaded into the swap chain inside d3d8_PresentFrame and the logo, EA SPORTS mark and trademark line are all legible. Destination verified by non-black pixel count (4031), not by hash.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "resolved",
+    "summary": "the intro video now displays: eabig.mpc decodes and the EA SPORTS BIG logo renders at 640x480"
+  },
+  "0x000A3890": {
+    "action": "preserve the fs: prefix through the lifter -- cannot be separated by offset",
+    "evidence": "parts 132-138; excluding offsets 8/0xC from the redirect regresses draws 62k->1.7k and blanks the screen",
+    "part": "138",
+    "recorded": "2026-09-02",
+    "status": "noted",
+    "summary": "circular-list terminator: tests MEM32(ecx+8)==ecx with ecx==0; the dropped fs: prefix redirects that to KPCR+8 (StackLimit, legitimately non-zero) so it can never report end-of-list"
+  },
+  "0x000A3E60": {
+    "action": "transcribed by hand from the XBE; three instructions ending in a tail jump to IconAtlas_GetEntry",
+    "evidence": "part 129: two call sites in sub_000A4410 left esp 16 low, epilogue popped garbage into esi",
+    "part": "129",
+    "recorded": "2026-09-02",
+    "status": "resolved",
+    "summary": "empty 'not detected' stub leaking 8 bytes per call; caused the intermittent menu segfault"
+  },
+  "0x000AA1A0": {
+    "action": "esi is callee-saved in the guest ABI; an ICALL miss in the loop restores esp but leaves esi corrupted (see reference-icall-safe-clobbers-frame-saves). Fix the remaining misses on this path or make ICALL_SAFE preserve callee-saved registers.",
+    "evidence": "probed at loc_000AA22C: esi=0, so MEM32(esi+4)=4 from the guest null page and the vt[8] call target reads 0 -- 244M ICALL misses to address 0. Entry probe with --when 'ecx == 0' never fires, so esi is clobbered inside the loop, not passed in. Vtable 0x0019A744 is intact at runtime.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "load pump spins with esi=0 once FEInit_Boot returns"
+  },
+  "0x000AF7B0": {
+    "action": "catch the failing exit: the prologue pushes only esi, ebx/ebp/edi are pushed in conditional branches, so find the path whose epilogue pop count disagrees with its push count.",
+    "evidence": "part 156: bisecting Application_RunMainLoop's loop with --when 'esi == 0' isolates the vt[0x14] icall at loc_000AA244, which resolves live to 0x000AF7B0. Ruled out: an ICALL miss (calls nothing, cannot clobber), a bad epilogue (all 34 exits pop esi; loc_000AF8F9 probed balanced with MEM32(esp+12)=0x0031A440), and __chkstk 0x0015CDF0 (faithful, touches only eax/esp).",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "returns with esi clobbered to 0 on some later call, breaking the load pump"
+  },
+  "0x000AFBEE": {
+    "action": "none -- fixed; and run xverify.py --function on every hand-transcribed block",
+    "evidence": "part 147: null-page dump showed the whole 256-byte redirect window filled with one value; a write-watch on 0x041020F0 named sub_000AF7B0 -> sub_00150DCD. NULL indirect calls 134,768,796 -> 1 after the fix, and the title now loads the whole frontend",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "resolved",
+    "summary": "hand-transcribed block with two pushes in the wrong order: memset(NULL, esi+0x14CC, 0x29A8) instead of memset(esi+0x14CC, 0, 0x29A8). It wrote the buffer's address over 10,664 bytes from guest VA 0, poisoning the null page with 0x007696BC so every null-terminated list walk cycled forever"
+  },
+  "0x000B2430": {
+    "action": "if last_loc ever pins in 0x000B2430..0x000B2482, read the assert globals rather than debugging the loop.",
+    "evidence": "part 157: gated on [0x1E3DD8]; 0x000B2480 is a one-instruction self-loop, so reaching it is a designed halt, not a translation defect.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "the abort screen: renders the assert with ABORTFONT then deliberately hangs at 'jmp 0xB2480'"
+  },
+  "0x000B2620": {
+    "action": "",
+    "evidence": "",
+    "part": "130",
+    "recorded": "2026-09-02",
+    "status": "noted",
+    "summary": "execution-manager vtable 0x0019AE84 slot +0x00, not registered"
+  },
+  "0x000B2760": {
+    "action": "part 149: it IS called -- every frame, from Application_TickFrame's tail jump to [app->0x2C]->vt[0x10]. The old note that it was 'called by nothing' was looking only for direct callers",
+    "evidence": "part 130: the main thread blocks forever in XBoxExecutionMan_WaitForFrameEvent (0x000B2750), an INFINITE wait",
+    "part": "130",
+    "recorded": "2026-09-02",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "XBoxExecutionMan_SignalFrameEvent -- translated but called by nothing; on hardware the display ISR sets this event, and the bridge never delivers that interrupt"
+  },
+  "0x000FA570": {
+    "action": "no longer in the miss list after the part-129 stub fix",
+    "evidence": "",
+    "part": "127",
+    "recorded": "2026-09-02",
+    "resolved": "2026-09-02",
+    "status": "resolved",
+    "summary": "seeder cannot lift it; recover_batch reported 'could not lift'"
+  },
+  "0x00143850": {
+    "action": "check whether the bitstream buffer behind 0x203020 is ever refilled; the decoder looping in getbits with no progress is the shape of a buffer that never advances.",
+    "evidence": "part 157: the diag 'loc' command reports main_loc AND last_loc both pinned at loc_00143850 with 0 of 40 samples moving, in 2 of 3 runs. The function is a getbits: (*(uint32_t*)([0x203020]+4)) >> (0x20 - arg). 0x203020 is the bitstream state pointer.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "MPEG bit reader; the main thread sits here when the intro video stalls"
+  },
+  "0x00146C40": {
+    "action": "part 146: not a decoder defect after all. The KeBugCheck came from the CRT's _getptd reading KPCR+0x24 as 188, inside the printf that was reporting the motion-vector error. With the IRQL fixed the run is clean and the message never appears",
+    "evidence": "part 146: appears only once the blit stops corrupting memory (0x0016BCE0 recovered). Not caused by the MMX movq change -- reverting only the five re-lifted conversion functions leaves the bugcheck in place. Blit destination verified in-bounds afterwards: 0xF3BAA080, one 2304-byte row, inside the 0x03BA0000..0x03DF8000 back buffer",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "the MPEG-1 decoder's motion-vector parser. It reports 'Invalid motion_vector code (MBA %d, pic %d)' and the guest calls KeBugCheck(0x0A), so the process exits with code 10 about 12 s in"
+  },
+  "0x00146F7F": {
+    "action": "part 145: already in the tree and measuring 3/3 clean. The earlier 'they crash' reading was wrong -- the tree they were measured against was crashing on the 0x0001AC10 ICALL miss, which is what produced the garbage-target cascade",
+    "evidence": "part 145: 3/3 runs crashed with them spliced; without them the same tree measures 3/3 clean once 0x0001AC10 is recovered",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "one of four continuations of sub_00146F50 reached through the jump table at 0x00146FF0 (MPEG-1 picture_coding_type dispatch). Recovering all four is correct in principle -- an ITAIL miss here leaves esp unbalanced -- but the four together still measured worse"
+  },
+  "0x00148B40": {
+    "action": "the blit is very likely being cleared before Present -- check the ordering between the main thread's blit and the timer thread's Clear/Present, and whether the video should suppress the normal frame loop while it plays.",
+    "evidence": "part 159: after the 0x0014441B fix, LoadingScreen_BlitImageToBackBuffer runs 60 times in a 45 s run with correct pitch 0x0A00, yet dumped frames stay at mean brightness 1-2 with 12-15 distinct colours. The blit happens on the main thread inside VideoPlayer_Open's synchronous play loop while the frame-timer thread independently clears and presents.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "the video's frame blit runs (60/run) but the presented backbuffer is still black"
+  },
+  "0x00148C60": {
+    "action": "trace what fills the buffer it counts; eabig.mpc opens with status 0, so the open succeeds and only the streaming does not.",
+    "evidence": "part 157: it is the ready-chunk count read by the loop at 0x00149137; eax is 0 on every iteration.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "returns 0 forever, wedging the video pre-roll"
+  },
+  "0x001490C0": {
+    "action": "root cause found and fixed: sub_0014441B was an undetected stub inside the MPEG decoder chain. sub_001442FA branches to it when eax<0x10, and the empty stub returned without popping the 5 registers or the return address -- leaking 0x18 per call. That overflowed the 1 MB guest stack past its base (0x04140000) and into the heap, where a push destroyed the VideoPlayer object's vtable pointer at 0x02BF9A30. Recovered part 159: esp no longer crosses the base, [player] stays 0x001A83FC, and frame blits went 4 -> 60 per run.",
+    "evidence": "part 158: loop is do{vt[8](); sub_0014B570(); vt[0xC](-1);}while(!vt[0x10]()). Probing esi/[esi] each iteration: iterations 1-3 have esi=0x02BF9A30 and [esi]=0x001A83FC (correct VideoPlayer vtable); on iteration 4 [esi] reads 0. A startup write-watch (XBOX_DIAG_WATCH=0x02BF9A30) catches the writer: hit #4 has guest esp=0x02BF9A30 -- the stack pointer IS the object -- with main=loc_00143850 (MPEG getbits), last=loc_000B26A9, same tid 3060 whose esp was 0x0423FECC on the previous hit. So a push with a corrupted esp destroys the vtable pointer; every vt call then misses (110M ICALL misses to 0x00202AE8 and 0 at recomp_0007.c:11471/11486/11494) and IsFinished returns 0 forever.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-03",
+    "status": "resolved",
+    "summary": "the intro video's playback loop spins forever because the VideoPlayer object's vtable pointer is scribbled by a corrupted guest esp"
+  },
+  "0x00149137": {
+    "action": "find why sub_00148C60 (0x00148C60, 182 bytes) reports zero ready chunks -- the async read that fills the ring is the thing to check, not the loop.",
+    "evidence": "part 157: probing all 55 labels of the VideoPlayer_Open chain in one run reaches 41 of them and stops cycling 0x149137 -> 0x14913E -> 0x149148 with eax=0 every pass. The loop is 'pump (sub_0014B6E0 -> CRT 0x00151CB5), then ecx=this; sub_00148C60()' and spins while eax < [this+0x64]-2, so the video buffer never fills. Reached with the real intro object: TitleIntroSequence_Render -> sub_0007CF76 -> sub_000855B0 -> sub_000A3730 (VideoPlayer ctor, obj 0x02BF9A30, vtable 0x001A83FC) -> vt[4] Open 0x00148E00.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "video pre-roll buffering loop never exits: sub_00148C60 always returns 0"
+  },
+  "0x001493E0": {
+    "action": "done. Remaining video work is frame rate (~1.5 fps) and audio.",
+    "evidence": "part 163: framebuffer bytes went from 'F3 00 F3 00' (luma only, magenta image) to 'F3 F2 F5 FF' (proper BGRA) after implementing the MMX packed-integer ops and re-lifting. Live path is the 0x00149C54 jump table -> PixelBlit_ConvertRowsFormat1 -> sub_001493E0, format code 1 -- not the four converters fixed in part 158, which are dead in this build.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "resolved",
+    "summary": "the video's YUV-to-RGB row converter: paddw and packuswb were emitted as TODO comments, so chroma was never added and results were never packed to bytes"
+  },
+  "0x00149450": {
+    "action": "Nothing. The live converter is 0x001493E0.",
+    "evidence": "Part 177: 40 s probe -- 0 hits here, 12,544 on the live converter sub_001493E0. The user's screenshot was an animated-intro frame; part 176 compared it with settled-logo captures.",
+    "part": "177",
+    "recorded": "2026-09-26",
+    "status": "noted",
+    "summary": "DEAD in this build -- never executes; part 176's claim that its relift fixed the video was wrong"
+  },
+  "0x00149500": {
+    "action": "Nothing. The live converter is 0x001493E0.",
+    "evidence": "Part 177: 40 s probe -- 0 hits here, 12,544 on the live converter sub_001493E0. The user's screenshot was an animated-intro frame; part 176 compared it with settled-logo captures.",
+    "part": "177",
+    "recorded": "2026-09-26",
+    "status": "noted",
+    "summary": "DEAD in this build -- never executes; part 176's claim that its relift fixed the video was wrong"
+  },
+  "0x001495E0": {
+    "action": "Nothing. The live converter is 0x001493E0.",
+    "evidence": "Part 177: 40 s probe -- 0 hits here, 12,544 on the live converter sub_001493E0. The user's screenshot was an animated-intro frame; part 176 compared it with settled-logo captures.",
+    "part": "177",
+    "recorded": "2026-09-26",
+    "status": "noted",
+    "summary": "DEAD in this build -- never executes; part 176's claim that its relift fixed the video was wrong"
+  },
+  "0x00149670": {
+    "action": "Nothing. The live converter is 0x001493E0.",
+    "evidence": "Part 177: 40 s probe -- 0 hits here, 12,544 on the live converter sub_001493E0. The user's screenshot was an animated-intro frame; part 176 compared it with settled-logo captures.",
+    "part": "177",
+    "recorded": "2026-09-26",
+    "status": "noted",
+    "summary": "DEAD in this build -- never executes; part 176's claim that its relift fixed the video was wrong"
+  },
+  "0x001499E8": {
+    "action": "the Xbox port most likely does YUV->RGB on the GPU; find the texture-upload path used by VideoPlayer Tick (vt[0x0C]) instead of chasing these.",
+    "evidence": "part 158: sub_00149450/500/5E0/670 are called only from PixelBlit_ConvertRowsFormat2And3/4And5/6And7Interlaced (0x001499E8/0x00149A81/0x00149B1B), and those three have ZERO callers in the generated code and zero data references (dataxref finds nothing storing their addresses). Probed live: the converters never execute even while the MPEG decoder consumes 713 KB and the playback loop at 0x001490C0 runs 5000+ times.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "PixelBlit CPU colour converters appear dead in the Xbox build"
+  },
+  "0x0014B6E0": {
+    "action": "confirm 0x00151CB5 actually yields; if it is a no-op the pump never lets the reader run.",
+    "evidence": "part 157: 5 instructions, sub_0014B6E0(arg) -> sub_00151CB5(arg, 1). Called from the loop at 0x00149137 that waits for decoded frames.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "the video pre-roll pump; calls CRT 0x00151CB5 and nothing else"
+  },
+  "0x00169AA0": {
+    "action": "",
+    "evidence": "",
+    "part": "177",
+    "recorded": "2026-09-26",
+    "status": "noted",
+    "summary": "Dead in this build (0 hits in 40 s); its relift in part 176 changed nothing observable"
+  },
+  "0x0016B1C0": {
+    "action": "the call site in LoadingScreen_BlitImageToBackBuffer (recomp_0007.c) is hand-routed to hook_lockrect_0016B1C0; a relift of that function drops it. recomp_lookup_manual cannot be used -- it only sees indirect calls.",
+    "evidence": "part 169: pLockedRect is at [esp+8] on entry and must be read before the call (ret 16). On a plain run this finds 0xF3CCC000 and 0xF3BA0000 -- the pair that had been hardcoded in XBOX_GUEST_FB/FB2.",
+    "part": "",
+    "recorded": "2026-09-04",
+    "status": "noted",
+    "summary": "guest LockRect; wrapped to discover the video framebuffer automatically"
+  },
+  "0x0016B1C1": {
+    "action": "fixed: the channel test is now bounded by ACI_GLOB_CNT_OFF and both globals are handled explicitly. Kept unconditionally; 3/3 clean.",
+    "evidence": "part 170: ACI_NABM_CHANNELS(4) * ACI_CHANNEL_STRIDE(0x10) covers 0x100..0x13F, so GLOB_CNT (NABM+0x2C) was handled as channel 2 register 0x0C and GLOB_STA (NABM+0x30) as channel 3's BDBAR. AC97 has three bus-master channels ending at 0x2B; the globals start at 0x2C.",
+    "part": "",
+    "recorded": "2026-09-04",
+    "status": "noted",
+    "summary": "AC97 model: global registers were being swallowed by the channel range"
+  },
+  "0x0016BCE0": {
+    "action": "none -- recovered",
+    "evidence": "part 146: the blit then computed dest = 0 + 0x7696BC*0x40 + 0x7696BC*4 = 0x1F8009F0 and wrote ~30 MB per frame into whatever the RAM mirrors covered; working set climbed to 4 GB. With it recovered: pitch 0x0A00 (640*4), pBits 0xF3BA0000, one 2304-byte row per call, peak working set 148 MB",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "resolved",
+    "summary": "the surface-geometry helper LockRect depends on: it computes the back buffer's pitch and base and writes them through output pointers. Undetected, so it was a stub, and LockRect returned stack garbage -- pitch 0x40, pBits 0"
+  },
+  "0x00172202": {
+    "action": "find why the D3D object's device pointer at [this+0] is null; that is the fix, not the redirect",
+    "evidence": "part 146: write-watch on XBOX_NULL_PAGE_VA names it, reached from sub_0016FE73; per-call-site ICALL accounting names the reader as recomp_0002.c:60226 in sub_00083288",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "trap",
+    "summary": "Xbox D3D8 zeroes a 64-byte block at device + [this+0x128] + (i<<6) with this->device NULL, so it writes through the null-pointer redirect. That leaves non-zero values at VA 0, and UI_BuildButtonGroup's list walk then cycles between VA 0 and 0x007696BC forever -- 134,768,796 NULL indirect calls a run"
+  },
+  "0x00177AB2": {
+    "action": "Do not relift without first diffing the lifted body against the XBE with xverify --function. The hand-written body uses the older mm_* helper family and drops its movq loads; something else in the lifted version is wrong.",
+    "evidence": "Part 176: relifted alongside 0x00178164 to restore 40 dropped movq loads/stores in an 8x8 punpck transpose. User reported 'now every text is garbage' immediately. Reverted; text clean again. Isolated by relifting 0x00169AA0 alone, which kept text clean, so the regression is this pair. Their relift also made zero difference to the intro video (captures byte-identical), so they are not on the video path.",
+    "part": "176",
+    "recorded": "2026-09-04",
+    "status": "trap",
+    "summary": "Relifting this regresses text rendering to garbage"
+  },
+  "0x00178164": {
+    "action": "",
+    "evidence": "",
+    "part": "178",
+    "recorded": "2026-09-27",
+    "status": "noted",
+    "summary": "text-path trap from part 177: part 178 applied 15/19 flag-only hunks to it; if text garbles, these hunks are the suspect (pre-change body in RE_NOTES/gen_backups/pre_part178/)"
+  },
+  "0x00179411": {
+    "action": "Part 177: live by default, 8/8 clean. Blockers were xbox_HeapFree's 4-of-7-arg call, the 64-slot KTIMER map, and two lifter flag defects in DSOUND's IRQL lock.",
+    "evidence": "part 166: with it allowed, total kernel activity drops 20x (4,840 vs 102,766 calls) and KeStallExecutionProcessor -- a busy-wait primitive -- doubles to 2,001 (12% of all calls). The main thread reports BLOCKED at loc_001435B5, whose preceding call is sub_000A7F20. The APU comes up as 'DSP GP/EP initialized (STUBBED - passthrough mode)' with the MCPX aperture trapped at 0xFE800000.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "resolved": "2026-09-26",
+    "status": "resolved",
+    "summary": "DSOUND still collapses drawing to zero: it spin-waits on the stubbed APU DSP"
+  },
+  "0x0017E291": {
+    "action": "Recovered with 0x0017E453 and 0x0017E424 (batch-20260926-221805).",
+    "evidence": "",
+    "part": "177",
+    "recorded": "2026-09-26",
+    "status": "resolved",
+    "summary": "DSOUND APU scatter-gather heap Initialize(count), reached via thunk 0x0017E453 at vtbl 0x001A9BC0 slot 1; never translated, so the ICALL missed, eax=0 read as S_OK and the heap stayed empty -> E_OUTOFMEMORY x3 from DirectSoundCreate"
+  },
+  "0x0017E6E9": {
+    "action": "CAUTION: setting PCR also collapses drawing to zero in the DEFAULT build, with both DSOUND and the audio streaming thread denied -- so some other consumer of GLOB_STA changes behaviour once the codec claims ready. Reverted for now; find that consumer before re-enabling. The constants and reasoning are left in aci_mmio.c.",
+    "evidence": "part 167: the loop polls [0xFEC00130] for 0x100 every 20us for 1000 tries then fails (ebx=0). 0xFEC0012C/0x130 are GLOB_CNT/GLOB_STA at ACI_NABM_OFF+0x2C/+0x30. Setting PCR removes the spin entirely (2000 iterations -> 0) and takes the success path for the first time.",
+    "part": "",
+    "recorded": "2026-09-04",
+    "status": "noted",
+    "summary": "DSOUND's AC-link reset waits on AC97 GLOB_STA.PCR (0xFEC00130 bit 0x100), which never appears"
+  },
+  "0x0017E6EA": {
+    "action": "bounded window: trace DSOUND init forward from the codec-ready poll at 0x0017E6E9 to the first channel CR write.",
+    "evidence": "part 171: with XBOX_ACI_PCR=1 and the new DMA engine traced, no channel ever has CR.RPBM set -- zero [ACI-DMA] output -- while the boot still hangs. So the blocker sits between GLOB_STA.PCR being raised and the channels being programmed.",
+    "part": "",
+    "recorded": "2026-09-04",
+    "status": "noted",
+    "summary": "after codec-ready the title blocks before ever starting the AC97 bus master"
+  },
+  "0x0017FCEC": {
+    "action": "host bridge",
+    "evidence": "",
+    "part": "127",
+    "recorded": "2026-09-02",
+    "status": "hle",
+    "summary": "XPP section; 2 ICALL misses a run"
+  },
+  "0x001E3DE8": {
+    "action": "free assert reporting: read 0x1E3DE8/0x1E3DEC on any stuck run to get the exact EA source file and line. pathxSND.c:381 is the sound library, which fits the audio traps 0x000151F0 and 0x00179411 both being disabled.",
+    "evidence": "part 157: the panic handler at 0x000B27EB formats them with 'FILE %s LINE %d' (0x0019AE60) through 0x000B5C10, which is a single ret in retail -- so the message is compiled out but the globals are still set. Read them with the diag server instead. The fatal flag [0x1E3DD8] stays 0, so the abort screen (0x000B2430, which renders with ABORTFONT and then hangs at 'jmp 0xB2480') is not entered.",
+    "part": "",
+    "recorded": "2026-09-03",
+    "status": "noted",
+    "summary": "the game's assert globals: [0x1E3DE8]=source file string, [0x1E3DEC]=line. Reads 'libs\\include\\pathxSND.c' line 381 in 3 of 4 runs"
+  },
+  "0x00726584": {
+    "action": "",
+    "evidence": "",
+    "part": "178",
+    "recorded": "2026-09-27",
+    "status": "noted",
+    "summary": "Audio object zeroed by the stream converter sub_00019040 when the APU runs. Part 178 found the converter itself broken (NULL dest / pointer count via the 0x184C5 flag bug, collapsed fadd, missing _cf) -- this overlap is probably the same defect, not a heap overlap. Re-test with XBOX_APU_RUN=1 before chasing sub_0011D7A0."
+  }
+}

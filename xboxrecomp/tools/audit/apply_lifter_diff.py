@@ -18,14 +18,15 @@ else is reported and left alone. Nothing outside the hunks is touched.
     apply_lifter_diff.py OLD_GEN NEW_GEN [--gen GEN] [--dry-run]
 
 OLD_GEN / NEW_GEN are the two full translations (tools.recomp --all --split
-into separate --gen-dir's); GEN defaults to ssx_recomp/src/recomp/gen.
+into separate --gen-dir's); GEN defaults to the port's src/recomp/gen (see ssxpaths.py).
 Functions are matched by address, so renamed functions are found.
 """
 import argparse, difflib, io, os, re, sys
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
-GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
+GEN = ssxpaths.GEN
 FN = re.compile(r'^(?:static\s+)?\w[\w\s\*]*?\b(\w+)\s*\(void\)\s*$')
 SUB = re.compile(r'^sub_([0-9A-Fa-f]{8})$')
 

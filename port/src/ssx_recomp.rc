@@ -1,0 +1,7 @@
+/* Resources for the game executable (part 183): the application icon, used
+ * by Explorer, the launcher and the game window, and the manifest that turns
+ * on themed controls and per-monitor DPI awareness. */
+#include <windows.h>
+
+1 ICON "ssx_recomp.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "ssx_recomp.manifest"

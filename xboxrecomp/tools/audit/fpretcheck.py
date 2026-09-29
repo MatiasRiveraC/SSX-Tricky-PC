@@ -22,10 +22,11 @@ XBOX_X87_RET picks the behaviour and 0x100 logs each site's first outcomes.
     fpretcheck.py
 """
 import argparse, glob, io, os, re, sys
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 CALL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\(\); /\* call|RECOMP_ICALL_SAFE")
 HANDOFF = "fp_push(g_x87_st0); /* value returned in ST(0) by the call above */"
 LOC = re.compile(r"RECOMP_LOC\((0x[0-9A-Fa-f]+)\)")

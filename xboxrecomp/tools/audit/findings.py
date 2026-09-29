@@ -30,6 +30,7 @@ STATUSES
   resolved  previously a problem, now fixed.  Kept for the history.
 """
 import argparse
+import ssxpaths
 import json
 import os
 import sys
@@ -37,7 +38,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-PATH = os.path.join(ROOT, "RE_NOTES", "findings.json")
+PATH = ssxpaths.FINDINGS
 
 BLOCKING = ("trap", "bad-body")
 STATUSES = ("trap", "bad-body", "hle", "unliftable", "noted", "resolved")

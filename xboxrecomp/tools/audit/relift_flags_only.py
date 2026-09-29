@@ -29,10 +29,11 @@ reason, for a person to look at.
     relift_flags_only.py 0x0017E9EF 0x0017992D
 """
 import argparse, difflib, io, os, re, shutil, subprocess, sys
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
-GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
+GEN = ssxpaths.GEN
 FN = re.compile(r'^(?:static\s+)?\w[\w\s\*]*?\b(\w+)\s*\(void\)\s*$')
 
 SNAP_LINE = re.compile(

@@ -47,6 +47,7 @@ a dummy return address rather than a real one.
 """
 
 import argparse
+import ssxpaths
 import io
 import os
 import re
@@ -54,7 +55,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-DEFAULT_GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
+DEFAULT_GEN = ssxpaths.GEN
 
 MARK = "/*XPROBE*/"
 BEGIN = "/*XPROBE-BEGIN*/"

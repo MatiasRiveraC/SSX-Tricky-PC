@@ -28,6 +28,7 @@ the former reports LINK CLEAN while the build is failing.
 """
 
 import argparse
+import ssxpaths
 import io
 import os
 import re
@@ -42,15 +43,15 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 XBOX = os.path.join(ROOT, "xboxrecomp")
-XBE = os.path.join(ROOT, "Game Data", "default.xbe")
-ANALYSIS = os.path.join(ROOT, "xboxrecomp_output", "ssx_analysis.json")
-GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
+XBE = ssxpaths.XBE
+ANALYSIS = ssxpaths.ANALYSIS
+GEN = ssxpaths.GEN
 # Lift call targets under the names the tree already uses (lifter._tree_names).
 os.environ.setdefault("XLIFT_NAME_MAP", os.path.join(GEN, "recomp_dispatch.c"))
-RECOMP_DIR = os.path.join(ROOT, "ssx_recomp", "src", "recomp")
-BUILD = os.path.join(ROOT, "ssx_recomp", "build")
+RECOMP_DIR = ssxpaths.RECOMP
+BUILD = ssxpaths.BUILD
 EXE = os.path.join(BUILD, "SSX Tricky.exe")
-BACKUPS = os.path.join(ROOT, "RE_NOTES", "recover_batches")
+BACKUPS = ssxpaths.BACKUPS
 
 FILES = [(GEN, "recomp_recovered.c"), (GEN, "recomp_dispatch.c"),
          (GEN, "recomp_stubs_unresolved.c"), (RECOMP_DIR, "recomp_funcs.h"),

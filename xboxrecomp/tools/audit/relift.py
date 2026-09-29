@@ -16,6 +16,7 @@ xbrun.py afterwards: this replaces working code, so it can regress.
 """
 
 import argparse
+import ssxpaths
 import io
 import os
 import re
@@ -27,12 +28,12 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 XBOX = os.path.join(ROOT, "xboxrecomp")
-XBE = os.path.join(ROOT, "Game Data", "default.xbe")
-ANALYSIS = os.path.join(ROOT, "xboxrecomp_output", "ssx_analysis.json")
-GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
+XBE = ssxpaths.XBE
+ANALYSIS = ssxpaths.ANALYSIS
+GEN = ssxpaths.GEN
 # Lift call targets under the names the tree already uses (lifter._tree_names).
 os.environ.setdefault("XLIFT_NAME_MAP", os.path.join(GEN, "recomp_dispatch.c"))
-BACKUPS = os.path.join(ROOT, "RE_NOTES", "recover_batches")
+BACKUPS = ssxpaths.BACKUPS
 BODY = re.compile(r"^void (sub_[0-9A-F]{8}|[A-Za-z_]\w*)\(void\)$", re.M)
 
 

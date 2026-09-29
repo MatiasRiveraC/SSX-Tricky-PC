@@ -20,12 +20,13 @@ recover_batch.py:
     switchtargets.py --addrs      # just the addresses, space separated
 """
 import argparse, glob, io, os, re, struct
+import ssxpaths
 from vtsweep import sections
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
-GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
-XBE = os.path.join(ROOT, "ssx_recomp", "build", "game", "default.xbe")
+GEN = ssxpaths.GEN
+XBE = ssxpaths.XBE
 SITE = re.compile(r"RECOMP_ITAIL\(MEM32\((\w+) \* 4 \+ 0x([0-9A-Fa-f]+)\)\)")
 BOUND = re.compile(r"CMP_A\((\w+), (0x[0-9A-Fa-f]+|\d+)\)")
 BYTEIDX = re.compile(r"(\w+) = ZX8\(MEM8\((\w+) \+ 0x([0-9A-Fa-f]+)\)\)")

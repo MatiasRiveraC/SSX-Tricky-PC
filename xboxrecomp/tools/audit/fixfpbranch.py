@@ -33,6 +33,7 @@ unconditional one, because it looks deliberate.
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -43,8 +44,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-DEFAULT_GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
-DEFAULT_XBE = os.path.join(ROOT, "Game Data", "default.xbe")
+DEFAULT_GEN = ssxpaths.GEN
+DEFAULT_XBE = ssxpaths.XBE
 SUFFIX = ".bak_fpbranch"
 
 FUNC = re.compile(r"^void (?P<name>\w+)\(void\)$")

@@ -32,6 +32,7 @@ set:
                   else green is the signature of a dispatch-table regression.
 """
 import argparse
+import ssxpaths
 import json
 import os
 import re
@@ -41,8 +42,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-GAME = os.path.join(ROOT, "ssx_recomp", "build", "SSX Tricky.exe")
-LOGDIR = os.path.join(ROOT, "RE_NOTES")
+GAME = ssxpaths.GAME_EXE
+LOGDIR = ssxpaths.LOGDIR
 LEDGER = os.path.join(LOGDIR, "measurements.jsonl")
 
 RE_DRAWS = re.compile(r"draws=(\d+)")
@@ -68,7 +69,7 @@ def check_fresh(auto_build):
     if not os.path.exists(GAME):
         sys.exit("no game binary at %s -- build first" % GAME)
     exe = os.path.getmtime(GAME)
-    src_root = os.path.join(ROOT, "ssx_recomp", "src")
+    src_root = ssxpaths.SRC
     newest, newest_t = None, 0.0
     for base, _dirs, files in os.walk(src_root):
         if os.path.basename(base).startswith("gen.bak"):
@@ -88,7 +89,7 @@ def check_fresh(auto_build):
                  "Rebuild first, or pass --build to do it here." % rel)
     print("stale: %s is newer than the binary -- rebuilding" % rel)
     rc = subprocess.run(["mingw32-make", "-j8"],
-                        cwd=os.path.join(ROOT, "ssx_recomp", "build"),
+                        cwd=ssxpaths.BUILD,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, errors="replace")
     bad = [l for l in rc.stdout.splitlines()

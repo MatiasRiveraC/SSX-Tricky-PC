@@ -36,6 +36,7 @@ Forward direction (DF clear) is assumed, as it is for the already-translated
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -44,7 +45,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 
 OP = re.compile(r"^(?P<ind>\s*)/\* (?P<mn>repe cmpsb|repe cmpsd|repne scasb)"
                 r" - string (compare|scan),[^*]*\*/\s*$")

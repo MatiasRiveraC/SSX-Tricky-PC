@@ -26,6 +26,7 @@ of the project's findings rather than in a scratch directory.
 """
 
 import argparse
+import ssxpaths
 import difflib
 import io
 import json
@@ -37,7 +38,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 KERNEL = os.path.join(ROOT, "xboxrecomp", "src", "kernel")
-STORE = os.path.join(ROOT, "RE_NOTES", "layout_snapshots")
+STORE = os.path.join(ssxpaths.NOTES, "layout_snapshots")
 FILES = ["xbox_memory_layout.h", "xbox_memory_layout.c"]
 META = "snapshot.json"
 

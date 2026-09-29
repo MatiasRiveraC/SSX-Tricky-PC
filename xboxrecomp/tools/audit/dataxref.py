@@ -22,6 +22,7 @@ what refers to an arbitrary address, in either direction.
 """
 
 import argparse
+import ssxpaths
 import os
 import struct
 import sys
@@ -61,9 +62,7 @@ def main():
     a = ap.parse_args()
 
     va = int(a.addr, 0)
-    xbe = a.xbe or os.path.join(
-        os.path.normpath(os.path.join(HERE, "..", "..", "..")),
-        "Game Data", "default.xbe")
+    xbe = a.xbe or ssxpaths.XBE
     img = Image(xbe)
     names = {addr: n for addr, n in load_dispatch(DISPATCH)}
 

@@ -23,9 +23,10 @@ older pass had already rewritten, and flag snapshots.
     fixnarrowsign.py [--dry-run]
 """
 import argparse, glob, io, os, re
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GEN = os.path.normpath(os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+GEN = ssxpaths.GEN
 
 ARG = r"[^()]*(?:\([^()]*\)[^()]*)*"          # one level of nested parentheses
 N8 = r"(?:LO8|HI8|MEM8)\(" + ARG + r"\)|\(\(uint8_t\)_fs[ab]\)"

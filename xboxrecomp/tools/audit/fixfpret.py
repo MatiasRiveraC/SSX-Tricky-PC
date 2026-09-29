@@ -47,6 +47,7 @@ another path entirely.
 """
 
 import argparse
+import ssxpaths
 import glob
 import io
 import os
@@ -55,7 +56,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GEN = os.path.normpath(
-    os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+    ssxpaths.GEN)
 
 CALL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\(\); /\* call|RECOMP_ICALL_SAFE")
 PUSH = re.compile(r"\bfp_push\(")

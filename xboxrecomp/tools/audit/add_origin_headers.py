@@ -23,10 +23,11 @@ address so renamed functions are covered.
     add_origin_headers.py FRESH_GEN [--gen GEN] [--file recomp_recovered.c] [--dry-run]
 """
 import argparse, io, os, re, sys
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
-GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
+GEN = ssxpaths.GEN
 FUNC = re.compile(r"^void (\w+)\(void\)$")
 ORIGIN = re.compile(r"^\s*\*\s*Original:\s*0x[0-9A-Fa-f]{8}\s*-\s*0x[0-9A-Fa-f]{8}")
 SUB = re.compile(r"^sub_([0-9A-Fa-f]{8})$")

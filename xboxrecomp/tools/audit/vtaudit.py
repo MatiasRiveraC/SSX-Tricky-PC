@@ -31,6 +31,7 @@ resolve to a defined symbol or the link fails.
 """
 
 import argparse
+import ssxpaths
 import io
 import os
 import re
@@ -39,9 +40,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
-XBE = os.path.join(ROOT, "Game Data", "default.xbe")
-DISPATCH = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen",
-                        "recomp_dispatch.c")
+XBE = ssxpaths.XBE
+DISPATCH = os.path.join(ssxpaths.GEN, "recomp_dispatch.c")
 
 ENTRY = re.compile(r"^\s*\{ 0x([0-9A-Fa-f]{8})u, \(recomp_func_t\)"
                    r"([A-Za-z_][A-Za-z0-9_]*)")

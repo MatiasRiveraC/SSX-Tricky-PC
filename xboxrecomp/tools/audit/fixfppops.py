@@ -17,9 +17,10 @@ against st(i), i > 1, also compared with st(1); they now name st(i).
     fixfppops.py [--dry-run]
 """
 import argparse, glob, io, os, re
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GEN = os.path.normpath(os.path.join(HERE, "..", "..", "..", "ssx_recomp", "src", "recomp", "gen"))
+GEN = ssxpaths.GEN
 
 MEMCMP = re.compile(r"^(?P<ind>\s*)\{ double _fc = (?P<rhs>[^;]+); (?P<body>_fpu_cmp = [^}]*?) \} "
                     r"/\* (?P<mn>f(?:i|u)?comp) (?P<ops>[^*]*)\*/")

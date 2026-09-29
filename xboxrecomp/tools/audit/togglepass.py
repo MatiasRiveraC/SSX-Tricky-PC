@@ -21,8 +21,9 @@ without the first hands the render loop a cursor still holding its allocator
 poison.
 """
 import io, re, sys
+import ssxpaths
 
-GEN = "../../../ssx_recomp/src/recomp/gen/recomp_0005.c"
+GEN = os.path.join(ssxpaths.GEN, "recomp_0005.c")
 FUNCS = ("SceneView_RenderPass", "SceneRenderer_RenderAllPasses")
 BROKEN_CMP = re.compile(
     r"^(\s*)_fpu_cmp = \(fp_top\(\) < fp_st1\(\)\) \? -1 : \(fp_top\(\) > fp_st1\(\)\) \? 1 : 0; "

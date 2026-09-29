@@ -20,11 +20,12 @@ function in the Ghidra export. That drops pointers into the middle of code
 functions.
 """
 import argparse, io, os, re, struct
+import ssxpaths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
-GEN = os.path.join(ROOT, "ssx_recomp", "src", "recomp", "gen")
-XBE = os.path.join(ROOT, "ssx_recomp", "build", "game", "default.xbe")
+GEN = ssxpaths.GEN
+XBE = ssxpaths.XBE
 EXPORT = os.path.join(ROOT, "default.xbe.c")
 CODE_SECTIONS = (".text", "D3D", "D3DX", "XGRPH", "DSOUND", "XPP")
 
