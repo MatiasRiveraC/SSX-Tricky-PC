@@ -24,7 +24,12 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+/* Six slots: the frame thread keeps XA2_TARGET_QUEUED of them filled (see
+ * xa2_queued and throttle() in apu_core.c), so there is room for jitter on
+ * both sides. With three, and a submit that dropped the buffer whenever all
+ * three were queued, every pacing wobble became a click (part 179). */
+#define XA2_NUM_BUFS      6
+static unsigned long g_xa2_underruns = 0, g_xa2_drops = 0;
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -45,7 +50,28 @@ int xa2_init(void)
         return 0;
     }
 
-    hr = XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
+    /* XAudio2 ships as a COM DLL and MinGW provides the header but no import
+     * library, so resolve the entry point at runtime. 2.9 is present on
+     * Windows 10 and later; 2.8 covers Windows 8. */
+    {
+        typedef HRESULT (WINAPI *PFN_XAudio2Create)(IXAudio2 **, UINT32, UINT32);
+        static const char *const dlls[] = { "xaudio2_9.dll", "xaudio2_8.dll" };
+        PFN_XAudio2Create create = NULL;
+        HMODULE lib = NULL;
+        size_t i;
+
+        for (i = 0; i < sizeof(dlls) / sizeof(dlls[0]) && !create; i++) {
+            lib = LoadLibraryA(dlls[i]);
+            if (!lib) continue;
+            create = (PFN_XAudio2Create)(void *)GetProcAddress(lib, "XAudio2Create");
+            if (!create) { FreeLibrary(lib); lib = NULL; }
+        }
+        if (!create) {
+            fprintf(stderr, "[XA2] no XAudio2 runtime found -- audio output disabled\n");
+            return 0;
+        }
+        hr = create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
+    }
     if (FAILED(hr) || !g_xa2) {
         fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
         return 0;
@@ -116,6 +142,16 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
+/* Buffers the device still has to play -- the clock the APU frame thread
+ * paces itself by. */
+int xa2_queued(void)
+{
+    XAUDIO2_VOICE_STATE state;
+    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    return (int)state.BuffersQueued;
+}
+
 /* Submit a buffer of mixed samples to XAudio2.
  * Called from APU frame thread. Returns 1 if buffer was submitted. */
 int xa2_submit_samples(const int16_t *samples, int num_samples)
@@ -128,7 +164,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { g_xa2_drops++; return 0; }
+    if (state.BuffersQueued == 0 && g_xa2_frames_written > XA2_NUM_BUFS)
+        g_xa2_underruns++;          /* the device ran dry before this arrived */
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
@@ -142,6 +180,39 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
+
+    /* Say whether what reaches the speakers is sound or silence. A buffer
+     * count alone cannot tell -- the pipeline submits zeros whenever no voice
+     * is playing, so "frames written" rises either way. Reported every 5 s
+     * while anything non-silent has been heard, and once when output first
+     * stops being silent. */
+    {
+        static int peak = 0, announced = 0;
+        static unsigned long loud = 0, last_tick = 0;
+        int k, bpeak = 0;
+        for (k = 0; k < copy_samples * XA2_CHANNELS; k++) {
+            int v = samples[k] < 0 ? -samples[k] : samples[k];
+            if (v > bpeak) bpeak = v;
+        }
+        if (bpeak > 64) loud++;
+        if (bpeak > peak) peak = bpeak;
+        if (loud && !announced) {
+            announced = 1;
+            fprintf(stderr, "[XA2] first non-silent buffer (peak %d) after %d buffers\n",
+                    bpeak, g_xa2_frames_written);
+            fflush(stderr);
+        }
+        if (loud) {
+            unsigned long now = GetTickCount();
+            if (now - last_tick >= 5000) {
+                last_tick = now;
+                fprintf(stderr, "[XA2] %d buffers sent, %lu non-silent, peak %d, "
+                        "%lu underruns, %lu dropped\n",
+                        g_xa2_frames_written, loud, peak, g_xa2_underruns, g_xa2_drops);
+                fflush(stderr);
+            }
+        }
+    }
     return 1;
 }
 

@@ -15,6 +15,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -293,63 +295,159 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
  * optionally queue a DPC when they expire.
  *
  * Implementation: Each XBOX_KTIMER contains a Win32 event (for waitable
- * behavior) and uses CreateTimerQueueTimer for the timing mechanism.
- * When the timer fires, it signals the event and optionally invokes the DPC.
+ * behavior); the timer thread below fires it at the due time and runs the
+ * DPC, if any.
  * ============================================================================ */
 
-/* Global timer queue - created lazily on first timer use */
-static HANDLE g_timer_queue = NULL;
-static CRITICAL_SECTION g_timer_cs;
-static BOOL g_timer_cs_init = FALSE;
+/*
+ * The timer thread (part 183).
+ *
+ * Timers used to be Windows timer-queue timers. Those fire on the system
+ * clock's 15.6 ms grid whatever the timer resolution: asked for 9.4 ms, the
+ * title's frame timer fired after 16.8 ms on average and up to 16 ms late.
+ * The title's frame limiter (Application_FrameTimerCallback) re-arms a
+ * one-shot timer every frame, so its frames landed on that grid -- 15.6 or
+ * 31 ms apart -- and a race ran at 45-52 frames a second.
+ *
+ * Now one high-priority thread keeps the armed timers with exact due times
+ * on the performance counter, and sleeps on a high-resolution waitable timer
+ * until the earliest. Firing (event, DPC, periodic re-arm), arming and
+ * cancelling all happen under one lock, so a timer is never freed while it
+ * fires.
+ */
+#define KT_MAX 256
+static PXBOX_KTIMER     g_kt[KT_MAX];         /* armed timers */
+static LONGLONG         g_kt_due[KT_MAX];     /* QPC */
+static LONGLONG         g_kt_period[KT_MAX];  /* QPC, 0 = one-shot */
+static int              g_kt_n;
+static CRITICAL_SECTION g_kt_lock;
+static HANDLE           g_kt_wake, g_kt_wait;
+static LONGLONG         g_kt_qpf;
+static volatile LONG    g_kt_state;           /* 0 none, 1 starting, 2 ready */
 
-static void xbox_ensure_timer_queue(void)
+static void kt_log_fire(PXBOX_KTIMER timer, LONGLONG now)
 {
-    if (!g_timer_cs_init) {
-        InitializeCriticalSection(&g_timer_cs);
-        g_timer_cs_init = TRUE;
-    }
-
-    if (!g_timer_queue) {
-        EnterCriticalSection(&g_timer_cs);
-        if (!g_timer_queue) {
-            g_timer_queue = CreateTimerQueue();
-            if (!g_timer_queue) {
-                xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
-                    "Failed to create timer queue (error %u)", GetLastError());
-            }
-        }
-        LeaveCriticalSection(&g_timer_cs);
+    /* XBOX_TIMER_LOG=1 (diagnostic): how late one-shot timers fire against
+     * the delay asked for, summarised every 3 s. */
+    static int on = -1;
+    static LONG n = 0;
+    static double sum_req = 0, sum_act = 0, max_late = 0;
+    static LONGLONG last_print = 0;
+    double act;
+    if (on < 0) { const char *e = getenv("XBOX_TIMER_LOG"); on = e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0; }
+    if (!on || !timer->armed_qpc || timer->Period) return;
+    act = (double)(now - timer->armed_qpc) * 1000.0 / (double)g_kt_qpf;
+    if (on == 2)    /* XBOX_TIMER_LOG=2: every one-shot fire, timestamped */
+        fprintf(stderr, "[TFIRE] t=%.1f timer %p asked %lu after %.2f\n",
+                (double)now * 1000.0 / (double)g_kt_qpf, (void *)timer, (unsigned long)timer->due_ms, act);
+    n++; sum_req += timer->due_ms; sum_act += act;
+    if (act - timer->due_ms > max_late) max_late = act - timer->due_ms;
+    if (!last_print) last_print = now;
+    if (now - last_print > 3 * g_kt_qpf) {
+        fprintf(stderr, "[TIMER] %ld one-shot fires: asked %.2f ms, fired after %.2f ms on average (max late %.2f ms)\n",
+                n, sum_req / n, sum_act / n, max_late);
+        n = 0; sum_req = sum_act = max_late = 0;
+        last_print = now;
     }
 }
 
-/*
- * Timer callback - called by the Windows timer queue thread.
- * Signals the event (for KeWaitForSingleObject) and fires the DPC if set.
- */
-static VOID CALLBACK xbox_timer_callback(PVOID lpParameter, BOOLEAN TimerOrWaitFired)
+static int kt_find(PXBOX_KTIMER t)
 {
-    PXBOX_KTIMER timer = (PXBOX_KTIMER)lpParameter;
+    int i;
+    for (i = 0; i < g_kt_n; i++)
+        if (g_kt[i] == t) return i;
+    return -1;
+}
 
-    (void)TimerOrWaitFired;
+static void kt_remove_at(int i)
+{
+    g_kt_n--;
+    g_kt[i] = g_kt[g_kt_n];
+    g_kt_due[i] = g_kt_due[g_kt_n];
+    g_kt_period[i] = g_kt_period[g_kt_n];
+}
 
-    /* Signal the event so waiters wake up */
-    if (timer->win32_event)
-        SetEvent(timer->win32_event);
+static DWORD WINAPI kt_thread(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    for (;;) {
+        LARGE_INTEGER q;
+        LONGLONG next = 0x7FFFFFFFFFFFFFFFll;
+        int i;
 
-    /* Fire the DPC if one is associated */
-    if (timer->Dpc && timer->Dpc->DeferredRoutine) {
-        xbox_log(XBOX_LOG_TRACE, XBOX_LOG_SYNC, "Timer DPC firing: routine=%p",
-            timer->Dpc->DeferredRoutine);
-        timer->Dpc->DeferredRoutine(
-            timer->Dpc,
-            timer->Dpc->DeferredContext,
-            timer->Dpc->SystemArgument1,
-            timer->Dpc->SystemArgument2);
+        EnterCriticalSection(&g_kt_lock);
+        QueryPerformanceCounter(&q);
+        for (i = 0; i < g_kt_n; ) {
+            PXBOX_KTIMER t = g_kt[i];
+            if (g_kt_due[i] > q.QuadPart) {
+                if (g_kt_due[i] < next) next = g_kt_due[i];
+                i++;
+                continue;
+            }
+            kt_log_fire(t, q.QuadPart);
+            if (t->win32_event)
+                SetEvent(t->win32_event);
+            if (t->Dpc && t->Dpc->DeferredRoutine)
+                t->Dpc->DeferredRoutine(t->Dpc, t->Dpc->DeferredContext,
+                                        t->Dpc->SystemArgument1, t->Dpc->SystemArgument2);
+            /* The DPC may have re-armed or cancelled this timer; only touch
+             * the slot if it still holds the same timer. */
+            if (i < g_kt_n && g_kt[i] == t && g_kt_due[i] <= q.QuadPart) {
+                if (g_kt_period[i]) {
+                    g_kt_due[i] += g_kt_period[i];
+                    if (g_kt_due[i] <= q.QuadPart) g_kt_due[i] = q.QuadPart + g_kt_period[i];
+                    if (g_kt_due[i] < next) next = g_kt_due[i];
+                    i++;
+                } else {
+                    t->Inserted = FALSE;
+                    kt_remove_at(i);
+                }
+            } else {
+                i = 0;                       /* the list changed: rescan */
+                next = 0x7FFFFFFFFFFFFFFFll;
+            }
+        }
+        LeaveCriticalSection(&g_kt_lock);
+
+        if (next == 0x7FFFFFFFFFFFFFFFll) {
+            WaitForSingleObject(g_kt_wake, INFINITE);
+        } else {
+            LARGE_INTEGER due;
+            HANDLE h[2];
+            QueryPerformanceCounter(&q);
+            if (next <= q.QuadPart) continue;
+            due.QuadPart = -(LONGLONG)((double)(next - q.QuadPart) * 1e7 / (double)g_kt_qpf);
+            if (due.QuadPart == 0) due.QuadPart = -1;
+            h[0] = g_kt_wait;
+            h[1] = g_kt_wake;
+            if (g_kt_wait && SetWaitableTimer(g_kt_wait, &due, 0, NULL, NULL, FALSE))
+                WaitForMultipleObjects(2, h, FALSE, INFINITE);
+            else
+                WaitForSingleObject(g_kt_wake, (DWORD)((next - q.QuadPart) * 1000 / g_kt_qpf) + 1);
+        }
     }
+    return 0;
+}
 
-    /* If not periodic, mark as no longer inserted */
-    if (timer->Period == 0)
-        timer->Inserted = FALSE;
+static void xbox_ensure_timer_queue(void)
+{
+    if (InterlockedCompareExchange(&g_kt_state, 1, 0) == 0) {
+        LARGE_INTEGER f;
+        HANDLE th;
+        QueryPerformanceFrequency(&f);
+        g_kt_qpf = f.QuadPart;
+        InitializeCriticalSection(&g_kt_lock);
+        g_kt_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+        /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (0x2), where available. */
+        g_kt_wait = CreateWaitableTimerExW(NULL, NULL, 0x00000002, TIMER_ALL_ACCESS);
+        if (!g_kt_wait) g_kt_wait = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+        th = CreateThread(NULL, 0, kt_thread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
+        InterlockedExchange(&g_kt_state, 2);
+        return;
+    }
+    while (g_kt_state != 2) Sleep(0);
 }
 
 VOID __stdcall xbox_KeInitializeTimerEx(PXBOX_KTIMER Timer, XBOX_TIMER_TYPE Type)
@@ -386,81 +484,97 @@ BOOLEAN __stdcall xbox_KeSetTimerEx(
     PXBOX_KDPC Dpc)
 {
     BOOLEAN was_inserted;
-    DWORD due_ms;
-    DWORD period_ms;
+    LONGLONG rel_100ns;
+    LARGE_INTEGER now;
+    int i;
 
     if (!Timer)
         return FALSE;
 
     xbox_ensure_timer_queue();
 
-    was_inserted = Timer->Inserted;
-
-    /* Cancel existing timer if re-arming */
-    if (was_inserted && Timer->win32_timer) {
-        DeleteTimerQueueTimer(g_timer_queue, Timer->win32_timer, NULL);
-        Timer->win32_timer = NULL;
+    /* DueTime is 100 ns units: negative = relative, positive = absolute
+     * system time, 0 = now. Kept exact, not rounded to milliseconds. */
+    if (DueTime.QuadPart < 0) {
+        rel_100ns = -DueTime.QuadPart;
+    } else if (DueTime.QuadPart == 0) {
+        rel_100ns = 0;
+    } else {
+        LARGE_INTEGER sys;
+        GetSystemTimeAsFileTime((LPFILETIME)&sys);
+        rel_100ns = DueTime.QuadPart - sys.QuadPart;
+        if (rel_100ns < 0) rel_100ns = 0;
     }
 
-    /* Reset the event */
+    EnterCriticalSection(&g_kt_lock);
+    was_inserted = Timer->Inserted;
     if (Timer->win32_event)
         ResetEvent(Timer->win32_event);
-
     Timer->Dpc = Dpc;
     Timer->Period = Period;
-
-    /* Convert DueTime (100ns units) to milliseconds */
-    if (DueTime.QuadPart < 0) {
-        LONGLONG relative_100ns = -DueTime.QuadPart;
-        due_ms = (DWORD)(relative_100ns / 10000);
-        if (due_ms == 0 && relative_100ns > 0)
-            due_ms = 1;
-    } else if (DueTime.QuadPart == 0) {
-        due_ms = 0;
+    QueryPerformanceCounter(&now);
+    i = kt_find(Timer);
+    if (i < 0 && g_kt_n < KT_MAX)
+        i = g_kt_n++;
+    if (i >= 0) {
+        g_kt[i] = Timer;
+        g_kt_due[i] = now.QuadPart + (LONGLONG)((double)rel_100ns * (double)g_kt_qpf / 1e7);
+        g_kt_period[i] = Period > 0 ? (LONGLONG)Period * g_kt_qpf / 1000 : 0;
+        Timer->Inserted = TRUE;
     } else {
-        LARGE_INTEGER now;
-        GetSystemTimeAsFileTime((LPFILETIME)&now);
-        LONGLONG diff = DueTime.QuadPart - now.QuadPart;
-        due_ms = (diff > 0) ? (DWORD)(diff / 10000) : 0;
+        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC, "KeSetTimerEx: more than %d timers armed", KT_MAX);
     }
-
-    period_ms = (Period > 0) ? (DWORD)Period : 0;
-
-    DWORD flags = 0;
-    if (period_ms == 0)
-        flags |= WT_EXECUTEONLYONCE;
-
-    if (!CreateTimerQueueTimer(&Timer->win32_timer, g_timer_queue,
-                               xbox_timer_callback, Timer,
-                               due_ms, period_ms, flags)) {
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
-            "KeSetTimerEx: CreateTimerQueueTimer failed (error %u)", GetLastError());
-        return was_inserted;
-    }
-
-    Timer->Inserted = TRUE;
+    Timer->armed_qpc = now.QuadPart;
+    Timer->due_ms = (DWORD)(rel_100ns / 10000);
+    LeaveCriticalSection(&g_kt_lock);
+    SetEvent(g_kt_wake);
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
-        "KeSetTimerEx: timer=%p, due=%ums, period=%ums, dpc=%p",
-        Timer, due_ms, period_ms, Dpc);
+        "KeSetTimerEx: timer=%p, due=%lld00ns, period=%ldms, dpc=%p",
+        Timer, (long long)rel_100ns, (long)Period, Dpc);
 
     return was_inserted;
+}
+
+/*
+ * Tear down whatever host timer-queue timer a KTIMER holds, armed or not, and
+ * wait for a callback already running on it to finish.
+ *
+ * xbox_KeCancelTimer only deletes the queue timer while Inserted is set, which
+ * is right for KeCancelTimer's return value but leaves two things behind: a
+ * one-shot timer that has already fired still owns its queue-timer handle, and
+ * a timer re-initialised while armed loses its handle to the memset and keeps
+ * firing against the struct forever. Anything that is about to free or reuse a
+ * XBOX_KTIMER calls this first. See RE_NOTES part 177.
+ */
+VOID xbox_KeReleaseTimerResources(PXBOX_KTIMER Timer)
+{
+    int i;
+    if (!Timer)
+        return;
+    xbox_ensure_timer_queue();
+    EnterCriticalSection(&g_kt_lock);       /* also waits out a firing */
+    i = kt_find(Timer);
+    if (i >= 0) kt_remove_at(i);
+    Timer->Inserted = FALSE;
+    LeaveCriticalSection(&g_kt_lock);
 }
 
 BOOLEAN __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer)
 {
     BOOLEAN was_inserted;
+    int i;
 
     if (!Timer)
         return FALSE;
 
+    xbox_ensure_timer_queue();
+    EnterCriticalSection(&g_kt_lock);
     was_inserted = Timer->Inserted;
-
-    if (was_inserted && Timer->win32_timer) {
-        DeleteTimerQueueTimer(g_timer_queue, Timer->win32_timer, INVALID_HANDLE_VALUE);
-        Timer->win32_timer = NULL;
-        Timer->Inserted = FALSE;
-    }
+    i = kt_find(Timer);
+    if (i >= 0) kt_remove_at(i);
+    Timer->Inserted = FALSE;
+    LeaveCriticalSection(&g_kt_lock);
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_SYNC,
         "KeCancelTimer: timer=%p, was_inserted=%d", Timer, was_inserted);

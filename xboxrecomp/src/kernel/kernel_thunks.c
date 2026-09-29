@@ -393,8 +393,42 @@ void xbox_kernel_init(void)
     InitializeCriticalSection(&g_log_cs);
     g_log_cs_init = TRUE;
 
-    /* Try to open log file, fall back to stderr */
-    g_log_file = fopen("xbox_kernel.log", "w");
+    /*
+     * Open the kernel log, falling back to stderr.
+     *
+     * It used to be `fopen("xbox_kernel.log", "w")` -- i.e. in the process's
+     * working directory, which for every run is the build tree. That dropped a
+     * regenerated 1 MB file into the build output on each launch, next to the
+     * executable and the game data, where it is nothing but litter: it is
+     * truncated on every run and no tool reads it.
+     *
+     * It now goes to %TEMP%\ssx_recomp\, and XBOX_KERNEL_LOG overrides that
+     * with an explicit path -- or with "0"/"" to turn the file off entirely
+     * and keep everything on stderr. The working directory is used only if
+     * the temp path cannot be opened, so behaviour is never worse than before.
+     */
+    {
+        const char *want = getenv("XBOX_KERNEL_LOG");
+        if (want && (want[0] == '\0' || (want[0] == '0' && want[1] == '\0'))) {
+            g_log_file = NULL;                       /* explicitly disabled */
+        } else if (want) {
+            g_log_file = fopen(want, "w");
+        } else {
+            /* GetTempPathA can return up to MAX_PATH itself, so the joined
+             * path needs headroom or snprintf silently truncates it. */
+            char dir[MAX_PATH], path[MAX_PATH + 64];
+            DWORD n = GetTempPathA((DWORD)sizeof(dir), dir);
+            if (n > 0 && n < sizeof(dir)) {
+                snprintf(path, sizeof(path), "%sssx_recomp", dir);
+                CreateDirectoryA(path, NULL);        /* fine if it exists */
+                snprintf(path, sizeof(path), "%sssx_recomp\\xbox_kernel.log",
+                         dir);
+                g_log_file = fopen(path, "w");
+            }
+            if (!g_log_file)
+                g_log_file = fopen("xbox_kernel.log", "w");
+        }
+    }
 
     /* Set log level from environment variable if present */
     const char* log_env = getenv("XBOX_LOG_LEVEL");

@@ -346,10 +346,20 @@ void pcrtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         break;
     case NV_PCRTC_START:
         val &= 0x07FFFFFF;
-        d->pcrtc.start = val;
         NV2A_DPRINTF("PCRTC_START - %x %x %x %x\n",
                 d->vram_ptr[val+64], d->vram_ptr[val+64+1],
                 d->vram_ptr[val+64+2], d->vram_ptr[val+64+3]);
+        /* Moving the scanout base *is* the flip. SSX emits no
+         * NV097_FLIP_STALL -- it appears nowhere in the 386 distinct methods
+         * the push buffer carries -- so this register is the only swap signal
+         * there is, and until now nothing called Present at all: every draw
+         * the translator issued accumulated in a back buffer never shown.
+         * Only a real change counts; the title rewrites the same value while
+         * idle. */
+        if (val != d->pcrtc.start) {
+            d->pcrtc.start = val;
+            pgraph_d3d11_present(val);
+        }
         break;
     default:
         break;

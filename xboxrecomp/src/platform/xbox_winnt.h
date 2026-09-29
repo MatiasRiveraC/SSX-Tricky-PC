@@ -22,8 +22,19 @@
 #ifndef XBOX_WINNT_H
 #define XBOX_WINNT_H
 
-/* Thread-local storage qualifier (portable). */
-#if defined(_WIN32)
+/* Thread-local storage qualifier (portable).
+ * GCC's own __thread keyword is checked first (covers MinGW-on-Windows too,
+ * which also defines _WIN32) because __declspec(thread) on this toolchain
+ * silently drops the "thread" attribute on `extern` declarations
+ * (-Wattributes warns "'thread' attribute directive ignored") -- meaning any
+ * translation unit that only sees the extern (not the defining one) would
+ * generate ordinary non-TLS access code for what is actually a per-thread
+ * variable. __thread does not have that problem and is what this project's
+ * real build (MinGW/GCC) actually needs. True MSVC (no __GNUC__) still gets
+ * __declspec(thread), which is correct there. */
+#if defined(__GNUC__)
+#define XBOX_THREAD_LOCAL __thread
+#elif defined(_WIN32)
 #define XBOX_THREAD_LOCAL __declspec(thread)
 #else
 #define XBOX_THREAD_LOCAL __thread
@@ -40,8 +51,11 @@ static inline void xbox_path_normalize(char *p)
 #endif
 }
 
-/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX. */
-#if !defined(_MSC_VER)
+/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX.
+ * MinGW already declares a real __debugbreak() via its own headers
+ * (windows.h -> _mingw.h), so defining it as a macro here collides with
+ * that declaration -- exclude MinGW alongside MSVC. */
+#if !defined(_MSC_VER) && !defined(__MINGW32__)
 #define __debugbreak() __builtin_trap()
 #endif
 

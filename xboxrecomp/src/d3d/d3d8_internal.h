@@ -91,6 +91,8 @@ typedef struct D3D8Texture {
     UINT                    pitch;      /* Row pitch of level 0 */
     BOOL                    locked;
     BOOL                    dirty;
+    UINT                    lock_level; /* level being written (part 183) */
+    BYTE                   *lvl_mem;    /* staging for a level other than 0 */
 } D3D8Texture;
 
 typedef struct D3D8Surface {

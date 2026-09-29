@@ -22,6 +22,21 @@ add_compile_definitions(
     NOMINMAX
 )
 
+# A call to an undeclared function is a hard error in the runtime, not a
+# warning. C still accepts it as an implicit `int f()` taking any arguments,
+# and on Win64 that is not a style problem: missing arguments are read from
+# whatever sits in the caller's stack slots, and a pointer return is cut to 32
+# bits. xbox_HeapFree called the seven-argument xbox_heap_owner_of with four,
+# and the garbage `frames` pointer it wrote through zeroed the guest esp and
+# hung DirectSound teardown -- one warning line in a full rebuild, invisible
+# in an incremental one. See RE_NOTES part 177.
+#
+# Scoped to these hand-written libraries only. The generated code still has
+# implicit declarations of its own, which are the recompiler's to fix.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Werror=implicit-function-declaration)
+endif()
+
 # Option to build examples
 
 # ── Runtime Libraries ─────────────────────────────────────────

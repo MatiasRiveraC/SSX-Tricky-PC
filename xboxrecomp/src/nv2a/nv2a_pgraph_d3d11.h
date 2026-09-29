@@ -42,6 +42,11 @@ void pgraph_d3d11_flush(void);
  * Applies horizontal scroll offset to vertices in the chyron Y band. */
 void pgraph_d3d11_set_chyron_scroll(uint32_t frame);
 
+/* Hand the translator the base and size of the guest RAM window, so
+ * DRAW_ARRAYS can follow SET_VERTEX_DATA_ARRAY_OFFSET into vertex buffers.
+ * Called by the push buffer consumer, which already holds the mapping. */
+void pgraph_d3d11_set_mem_base(void *base, uint32_t size);
+
 /* Statistics */
 typedef struct {
     uint32_t frames;
@@ -52,6 +57,25 @@ typedef struct {
     uint32_t clears;
 } PgraphD3D11Stats;
 
+/* Present the frame.
+ *
+ * The title never emits NV097_FLIP_STALL -- it flips the way the hardware
+ * actually does, by moving the CRTC scanout base. So the swap is signalled by a
+ * write to NV_PCRTC_START, and pcrtc_write() calls this when the base changes.
+ * Without it nothing the translator draws is ever shown: the back buffer
+ * accumulates draws forever and the window keeps whatever was last composited.
+ */
+void pgraph_d3d11_present(uint32_t crtc_start);
+
+/* Non-zero once the title has flipped its render surface, i.e. the frame just
+ * built is complete and should be presented. Cleared by the caller. */
+int  pgraph_d3d11_take_frame_complete(void);
+int  pgraph_d3d11_flipping(void);
+
+/* XBOX_TEST_QUAD diagnostic: draw a known-good quad through this device. */
+void pgraph_d3d11_test_quad(void);
+
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);
 
 #endif /* NV2A_PGRAPH_D3D11_H */
+void pgraph_d3d11_present_guest_fb(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h);

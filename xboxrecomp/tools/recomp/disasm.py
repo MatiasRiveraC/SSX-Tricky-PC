@@ -80,6 +80,10 @@ class Operand:
     mem_scale: int = 1
     mem_disp: int = 0
     mem_size: int = 0  # operand size in bytes
+    # Segment override, e.g. "fs" for `mov eax, fs:0x28`. Capstone knows this;
+    # dropping it made a real fs: access indistinguishable from a null deref,
+    # which is what the low-address TIB redirect was working around.
+    mem_segment: Optional[str] = None
 
 
 @dataclass
@@ -130,6 +134,8 @@ def _parse_operand(cs, cs_op, insn_obj):
             mem_scale=cs_op.mem.scale,
             mem_disp=cs_op.mem.disp & 0xFFFFFFFF if cs_op.mem.disp >= 0 else cs_op.mem.disp,
             mem_size=cs_op.size,
+            mem_segment=(_reg_names.get(cs_op.mem.segment)
+                         if getattr(cs_op.mem, "segment", 0) else None),
         )
     else:
         # Register operand

@@ -208,6 +208,54 @@ class DisasmEngine:
 
         return count
 
+    def resync_at(self, address: int, max_bytes: int = 0x4000) -> int:
+        """Re-decode forward from `address`, replacing overlapping boundaries.
+
+        The linear sweep decodes each section from its start, so wherever it
+        desynchronises -- a jump table, alignment padding, inline data -- every
+        later boundary in that stretch is off by however many bytes it lost.
+        A real function start can then fall *inside* a phantom instruction, and
+        the function detector drops it: `get_instructions_in_range` returns
+        nothing for it, so `_build_functions` skips it with no diagnostic and
+        the address goes on being reported as an unresolved indirect call.
+
+        That is what "could not lift" means for a seeded address. Seeding says
+        "a function starts here", which is exactly the information the sweep
+        lacked, so use it: decode from that address and let the new boundaries
+        win. Returns the number of instructions decoded.
+        """
+        sec = self.image.get_section_at_va(address)
+        if sec is None:
+            return 0
+        data = self.image.get_section_data(sec)
+        if not data:
+            return 0
+        va_start = sec.virtual_addr
+        off = address - va_start
+        if off < 0 or off >= len(data):
+            return 0
+        end = min(len(data), off + max_bytes)
+
+        count = 0
+        furthest = address   # highest forward branch target seen so far
+        for cs_insn in self._cs.disasm(data[off:end], address):
+            insn = self._classify_instruction(cs_insn)
+            prev = self.instructions.get(insn.address)
+            if prev is not None and count > 0:
+                # Re-joined the existing stream: everything from here on
+                # already agrees, so leave it alone.
+                break
+            self.instructions[insn.address] = insn
+            count += 1
+            if insn.is_cond_jump and insn.jump_target is not None:
+                if address <= insn.jump_target < address + max_bytes:
+                    furthest = max(furthest, insn.jump_target)
+            if insn.is_terminator and insn.end_address > furthest:
+                break
+        if count:
+            self._sorted_addrs = None
+        return count
+
     def recursive_descent(self, start_addresses: List[int],
                           section_bounds: List[Tuple[int, int]]) -> Set[int]:
         """

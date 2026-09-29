@@ -4,8 +4,8 @@
  * Translates Xbox device-style paths to host filesystem paths:
  *   \Device\CdRom0\  -> <game_dir>/
  *   D:\               -> <game_dir>/
- *   T:\               -> <save_dir>/TitleData/
- *   U:\               -> <save_dir>/UserData/
+ *   T:\               -> <save_dir>/TDATA/<title id>/
+ *   U:\               -> <save_dir>/UDATA/<title id>/
  *   Z:\               -> <save_dir>/Cache/
  *
  * The Win32 build emits UTF-16 paths (for CreateFileW); the Linux build
@@ -41,22 +41,42 @@ typedef struct {
     const char* sub_posix;  /* sub-directory, POSIX slash form           */
 } path_rule;
 
+/* Per-title save sub-paths, e.g. "\\TDATA\\45410004".
+ *
+ * These used to be the constants "\\TitleData" and "\\UserData", which put T:
+ * and U: in different host directories from the ones the title reaches through
+ * \Device\Harddisk0\Partition1\TDATA\<id> and ...\UDATA\<id> -- the same
+ * logical storage under two names. The visible symptom was an empty UserData\
+ * appearing beside the real UDATA\, created when the title polls U:\ looking
+ * for a save device. Filled in by xbox_path_init once the title ID is known. */
+static char s_tdata_win[32]   = "\\TDATA";
+static char s_udata_win[32]   = "\\UDATA";
+static char s_tdata_posix[32] = "/TDATA";
+static char s_udata_posix[32] = "/UDATA";
+
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
-    { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
+    /* Partition1 is the Xbox *hard disk*, not the game disc: it holds TDATA
+     * (per-title data) and UDATA (user saves). It used to map to the game
+     * directory, which dropped TDATA/UDATA in among the read-only assets and
+     * -- because the game dir was resolved relative to the working directory
+     * -- could scatter save folders wherever the exe happened to be launched
+     * from. Route it to the save directory instead, matching what the
+     * hardware actually does. */
+    { "\\Device\\Harddisk0\\Partition1\\",    1, NULL,         NULL          },
     { "D:\\",                                 0, NULL,         NULL          },
     { "d:\\",                                 0, NULL,         NULL          },
     /* Y: is the Xbox dashboard partition; the dashboard opens its assets
      * (e.g. "Y:\default.xip") from there. Map it to the game dir. */
     { "Y:\\",                                 0, NULL,         NULL          },
     { "y:\\",                                 0, NULL,         NULL          },
-    { "T:\\",                                 1, "\\TitleData","/TitleData"  },
-    { "U:\\",                                 1, "\\UserData", "/UserData"   },
+    { "T:\\",                                 1, s_tdata_win,  s_tdata_posix },
+    { "U:\\",                                 1, s_udata_win,  s_udata_posix },
     { "Z:\\",                                 1, "\\Cache",    "/Cache"      },
     { "\\??\\D:\\",                           0, NULL,         NULL          },
     { "\\??\\Y:\\",                           0, NULL,         NULL          },
     { "\\??\\y:\\",                           0, NULL,         NULL          },
-    { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
+    { "\\??\\T:\\",                           1, s_tdata_win,  s_tdata_posix },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
 
@@ -100,8 +120,66 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     if (len > 0 && s_save_dir[len - 1] == L'\\')
         s_save_dir[len - 1] = L'\0';
 
+    /* Make sure the save root exists. Everything below it (TDATA/UDATA and
+     * the per-title-ID folders) is created on demand by NtCreateFile's
+     * directory path, but that only creates one level at a time -- so
+     * without this the very first TDATA create would fail on a missing
+     * parent. */
+    if (s_save_dir[0] && !CreateDirectoryW(s_save_dir, NULL)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS) {
+            xbox_log(XBOX_LOG_ERROR, XBOX_LOG_PATH,
+                     "could not create save directory %S (error %u)", s_save_dir, err);
+        }
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
+}
+
+/*
+ * Point T: and U: at this title's own save directories.
+ *
+ * On hardware these drive letters are per-title views of \TDATA\<id> and
+ * \UDATA\<id>, which is also where the title's \Device\Harddisk0\Partition1\
+ * paths land. Without this they resolved to separate directories and the two
+ * routes disagreed about where saves live. Safe to call before or after
+ * xbox_path_init; the rules table holds pointers to these buffers.
+ */
+void xbox_path_set_title_id(unsigned int title_id)
+{
+    snprintf(s_tdata_win,   sizeof s_tdata_win,   "\\TDATA\\%08X", title_id);
+    snprintf(s_udata_win,   sizeof s_udata_win,   "\\UDATA\\%08X", title_id);
+    snprintf(s_tdata_posix, sizeof s_tdata_posix, "/TDATA/%08X",   title_id);
+    snprintf(s_udata_posix, sizeof s_udata_posix, "/UDATA/%08X",   title_id);
+}
+
+/*
+ * Is this Xbox path on the game disc, and if so what follows the prefix?
+ *
+ * "Game disc" means any rule that resolves under the game directory
+ * (to_save == 0) -- \Device\CdRom0\, D:\, Y:\ and their \??\ forms. The
+ * hard-disk rule (Partition1, where TDATA/UDATA live) is to_save == 1 and
+ * so is deliberately excluded: saves must keep going to the real
+ * filesystem even when the disc itself is served from an ISO.
+ *
+ * Used by the file layer to decide whether a path should be resolved
+ * inside a mounted XDVDFS image instead of on the host filesystem.
+ */
+BOOL xbox_path_split_game_disc(const char* xbox_path, const char** remainder)
+{
+    if (!xbox_path) return FALSE;
+    if (!s_initialized) xbox_path_init(NULL, NULL);
+
+    for (int i = 0; i < PATH_RULE_COUNT; i++) {
+        if (s_rules[i].to_save) continue;
+        int skip = match_prefix(xbox_path, s_rules[i].prefix);
+        if (skip) {
+            if (remainder) *remainder = xbox_path + skip;
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)

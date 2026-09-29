@@ -8,7 +8,10 @@
 add_library(xbox_nv2a STATIC
     nv2a_core.c
     nv2a_pgraph_d3d11.c
+    nv2a_vsh_cpu.c
+    nv2a_psh.c
     nv2a_pb_replay.c
+    nv2a_live_pb.c
     nv2a_mmio_hook.c
     nv2a_pb_test.c
 )
@@ -30,6 +33,8 @@ else()
 endif()
 
 target_link_libraries(xbox_nv2a PRIVATE platform)
+# nv2a_live_pb.c creates the host D3D8 device the translator draws into
+target_link_libraries(xbox_nv2a PUBLIC xbox_d3d8)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
 endif()

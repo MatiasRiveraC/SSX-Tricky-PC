@@ -29,6 +29,32 @@
  * ============================================================ */
 
 uint8_t *g_apu_ram_ptr = NULL;
+extern MCPXAPUState *g_state;
+
+/* See apu_shim.h: an APU write into the title's image. */
+void apu_phys_write_check(hwaddr addr, uint32_t val, int width)
+{
+    static volatile LONG n = 0;
+    LONG k = InterlockedIncrement(&n);
+    if (k <= 8) {
+        MCPXAPUState *d = g_state;
+        void *fr[8];
+        USHORT nf = CaptureStackBackTrace(0, 8, fr, NULL);
+        uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+        USHORT i;
+        fprintf(stderr, "[APU] write into the image: phys 0x%08llX (masked 0x%08X) <- 0x%08X/%d;"
+                        " FENADDR=0x%08X VPVADDR=0x%08X VPSGEADDR=0x%08X VPSSLADDR=0x%08X"
+                        " FEMEMADDR=0x%08X FECV=0x%X; host:",
+                (unsigned long long)addr, (unsigned)(addr & 0x03FFFFFF), val, width,
+                d ? d->regs[NV_PAPU_FENADDR] : 0, d ? d->regs[NV_PAPU_VPVADDR] : 0,
+                d ? d->regs[NV_PAPU_VPSGEADDR] : 0, d ? d->regs[NV_PAPU_VPSSLADDR] : 0,
+                d ? d->regs[NV_PAPU_FEMEMADDR] : 0, d ? d->regs[NV_PAPU_FECV] : 0);
+        for (i = 0; i < nf; i++)
+            fprintf(stderr, " 0x%llX", (unsigned long long)((uintptr_t)fr[i] - base + 0x140000000ull));
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
 
 MCPXAPUState *g_state = NULL;
 
@@ -45,7 +71,9 @@ int g_dbg_voice_monitor = -1;
 uint64_t g_dbg_muted_voices[4] = { 0 };
 
 /* Global audio mute — disables all AWD/mixer sound playback */
-volatile int g_audio_muted = 0;  /* 0 = audio enabled */
+volatile int g_audio_muted = 0;
+volatile long g_vp_voice_frames = 0;  /* incremented in apu_vp.c voice_process */
+volatile long g_vp_idle_seen = 0;     /* voices found in a list but not ACTIVE */  /* 0 = audio enabled */
 
 /* ============================================================
  * Debug frame markers (minimal stubs)
@@ -133,6 +161,26 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     default:
         if (addr < 0x20000) {
+            /* The memory the APU writes into is named by these base
+             * registers; report each value the guest programs, since a base
+             * outside RAM is exactly what folds an APU write onto the image. */
+            switch (addr) {
+            case NV_PAPU_FENADDR: case NV_PAPU_FEMEMADDR:
+            case NV_PAPU_VPVADDR: case NV_PAPU_VPSGEADDR: case NV_PAPU_VPSSLADDR:
+            case NV_PAPU_GPSADDR: case NV_PAPU_GPFADDR:
+            case NV_PAPU_EPSADDR: case NV_PAPU_EPFADDR:
+                if (d->regs[addr] != (uint32_t)val) {
+                    static int shown = 0;
+                    if (shown++ < 48) {
+                        fprintf(stderr, "[APU] base register 0x%04X <- 0x%08X\n",
+                                (unsigned)addr, (uint32_t)val);
+                        fflush(stderr);
+                    }
+                }
+                break;
+            default:
+                break;
+            }
             qatomic_set(&d->regs[addr], (uint32_t)val);
         }
         break;
@@ -242,53 +290,59 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
-void mcpx_apu_monitor_frame(MCPXAPUState *d)
+/*
+ * Build one 256-sample monitor block: the APU's own output for the last eight
+ * 32-sample sub-frames, with the software mixer and the test tone on top.
+ *
+ * monitor.frame_buf is where the VP -> DSP pipeline leaves its output
+ * (apu_dsp.c writes each sub-frame's slice; at the VP monitor point apu_vp.c
+ * accumulates into it). This used to be cleared before rendering, and only
+ * the test tone and the HLE software mixer were sent to the host -- so every
+ * sample the emulated APU produced was discarded, and a title that drives the
+ * APU through its own statically linked DirectSound (SSX Tricky does) stayed
+ * silent however far its audio got. See RE_NOTES part 177.
+ */
+static void monitor_render_block(MCPXAPUState *d,
+                                 int16_t out[MIXER_FRAME_SAMPLES][2])
 {
-    if ((d->ep_frame_div + 1) % 8) {
-        return;
-    }
+    int16_t extra[MIXER_FRAME_SAMPLES][2];
+    int i, c;
 
-    /* XAudio2 path: render and submit a buffer */
-    if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
-
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+    memset(extra, 0, sizeof(extra));
+    if (!g_audio_muted) {
+        if (g_test_tone.active) {
+            for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                extra[i][0] = s;
+                extra[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
-        return;
+        mixer_render(extra, MIXER_FRAME_SAMPLES);
     }
 
-    if (!g_waveout.initialized) return;
+    for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+        for (c = 0; c < 2; c++) {
+            int v = g_audio_muted ? 0
+                  : (int)d->monitor.frame_buf[i][c] + (int)extra[i][c];
+            out[i][c] = (int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v));
+        }
+    }
 
+    /* The VP monitor point accumulates with +=, so the next block has to
+     * start from silence. */
+    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+}
+
+/* Hand one full buffer to waveOut, waiting (bounded) for the slot to free. */
+static void waveout_submit(MCPXAPUState *d, int16_t src[][2])
+{
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
-
-    /* Wait if this buffer is still playing (with timeout) */
     int wait_loops = 0;
+
     while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
         qemu_mutex_unlock(&d->lock);
         Sleep(1);
@@ -296,44 +350,53 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         if (++wait_loops > 50) break;
     }
 
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                d->monitor.frame_buf[i][0] = s;
-                d->monitor.frame_buf[i][1] = s;
-                g_test_tone.phase += g_test_tone.phase_inc;
-                if (g_test_tone.phase >= 2.0 * M_PI)
-                    g_test_tone.phase -= 2.0 * M_PI;
-            }
-        }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
-    }
-
-    /* Submit to waveOut */
+    memcpy(g_waveout.bufs[idx], src, WAVEOUT_BUF_SAMPLES * 2 * sizeof(int16_t));
     hdr->dwFlags &= ~WHDR_DONE;
     waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
 
     g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
     g_waveout.frames_written++;
+}
+
+/*
+ * Called once per 32-sample EP sub-frame; every eighth call ships a 256-sample
+ * block. Blocks are gathered into sink-sized buffers (1024 samples for
+ * XAudio2, WAVEOUT_BUF_SAMPLES for waveOut) so the sink sees one buffer per
+ * real-time interval instead of the old code's four-times-real-time bursts.
+ */
+void mcpx_apu_monitor_frame(MCPXAPUState *d)
+{
+    static int16_t acc[WAVEOUT_BUF_SAMPLES][2];
+    static int acc_n = 0;
+    int16_t block[MIXER_FRAME_SAMPLES][2];
+    int want, i;
+
+    if ((d->ep_frame_div + 1) % 8) {
+        return;
+    }
+
+    if (xa2_is_active())
+        want = xa2_get_buffer_size();
+    else if (g_waveout.initialized)
+        want = WAVEOUT_BUF_SAMPLES;
+    else
+        return;
+    if (want <= 0 || want > WAVEOUT_BUF_SAMPLES)
+        want = WAVEOUT_BUF_SAMPLES;
+
+    monitor_render_block(d, block);
+
+    for (i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+        acc[acc_n][0] = block[i][0];
+        acc[acc_n][1] = block[i][1];
+        if (++acc_n < want)
+            continue;
+        acc_n = 0;
+        if (xa2_is_active())
+            xa2_submit_samples((const int16_t *)acc, want);
+        else
+            waveout_submit(d, acc);
+    }
 }
 
 /* ============================================================
@@ -343,6 +406,19 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
+        return;
+    }
+
+    /* With XAudio2 live the sound device is the clock: produce until
+     * XA2_TARGET_QUEUED buffers (~85 ms) are waiting, then wait for it to
+     * drain one. The wall-clock pacing below ran at 1,499.4 frames/s against
+     * the device's 1,500, rounded every wait to whole milliseconds and threw
+     * time away when behind, so the queue alternately ran dry and overflowed
+     * -- the "slight noise" heard in part 179. */
+    if (xa2_is_active()) {
+        while (!d->pause_requested && xa2_queued() >= XA2_TARGET_QUEUED)
+            qemu_cond_timedwait(&d->cond, &d->lock, 2);
+        d->next_frame_time_us = 0;
         return;
     }
 
@@ -394,6 +470,37 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
+
+    /* Where does sound stop? Report, every 5 s once a voice has been mixed:
+     * how many pipeline frames ran, how many voice-frames the VP mixed, and
+     * the peak in mixbins 0/1 (what the DSP bypass sends on). Silence at
+     * XAudio2 with a non-zero peak here is an output problem; a zero peak
+     * with voices mixed is a sample-fetch or routing problem. */
+    {
+        static unsigned long frames = 0, last = 0;
+        static float peak = 0.0f;
+        int k;
+        frames++;
+        for (k = 0; k < NUM_SAMPLES_PER_FRAME; k++) {
+            float a = mixbins[0][k] < 0 ? -mixbins[0][k] : mixbins[0][k];
+            float b = mixbins[1][k] < 0 ? -mixbins[1][k] : mixbins[1][k];
+            if (a > peak) peak = a;
+            if (b > peak) peak = b;
+        }
+        {
+            unsigned long now = (unsigned long)GetTickCount();
+            if (now - last >= 5000) {
+                last = now;
+                fprintf(stderr, "[VP] %lu pipeline frames, %ld voice-frames mixed, "
+                        "mixbin 0/1 peak %.4f; list heads 2D=%04X 3D=%04X MP=%04X, "
+                        "idle-in-list %ld\n", frames, g_vp_voice_frames, peak,
+                        (unsigned)d->regs[NV_PAPU_TVL2D], (unsigned)d->regs[NV_PAPU_TVL3D],
+                        (unsigned)d->regs[NV_PAPU_TVLMP], g_vp_idle_seen);
+                fflush(stderr);
+            }
+        }
+    }
+
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
 
@@ -405,6 +512,8 @@ static void se_frame(MCPXAPUState *d)
 /* ============================================================
  * APU frame thread (background processing)
  * ============================================================ */
+
+extern int aci_dma_advance(unsigned samples);
 
 static void *mcpx_apu_frame_thread(void *arg)
 {
@@ -431,6 +540,12 @@ static void *mcpx_apu_frame_thread(void *arg)
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+
+        /* Advance the AC'97 bus-master DMA in step with the audio frame.
+         * Without this the descriptor list never moves and a driver that has
+         * started the bus master waits forever for a buffer completion --
+         * see aci_dma.c. 32 samples is this thread's frame size. */
+        aci_dma_advance(32);
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
@@ -531,6 +646,29 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);
+
+    /* Run the frame thread from the start. xemu resumes it when the VM enters
+     * RUN_STATE_RUNNING, and the pipeline's actual work is gated separately by
+     * SECTL.XCNTMODE and FECTL (see mcpx_apu_frame_thread). This port has no
+     * VM state change, so the only things that ever resumed it were the test
+     * tone and the HLE software mixer -- and a title whose own statically
+     * linked DirectSound drives the hardware (SSX Tricky) started voices on a
+     * voice processor that never ran a single frame. See RE_NOTES part 177.
+     *
+     * RUNS BY DEFAULT since part 178; XBOX_APU_RUN=0 holds it. It was held in
+     * part 177 because running it let EA's stream mixer write PCM from guest
+     * address 0 across .text, the kernel thunk table and .data -- which looked
+     * like a heap overlap. It was a chain of translation defects in the mixer
+     * and its codecs: a jcc taking flags from the wrong block (0x184C5), a
+     * collapsed x87 fadd and a missing carry in the converter (0x00019040),
+     * and untranslated codec callbacks whose ICALL misses shifted the mixer's
+     * stack frame by 20 bytes (0x00019950, 0x0001A990, 0x00012D30,
+     * 0x00012D00). All fixed; see RE_NOTES part 178. */
+    {
+        const char *e = getenv("XBOX_APU_RUN");
+        if (!(e && e[0] == '0'))
+            mcpx_apu_resume(d);
+    }
     qemu_mutex_unlock(&d->lock);
 
     fprintf(stderr, "[APU] MCPX APU initialized (standalone)\n");

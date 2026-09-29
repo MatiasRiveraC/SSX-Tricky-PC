@@ -13,12 +13,15 @@ Produces compilable C code using recomp_types.h macros.
 
 import json
 import os
+import re
 
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
-from .lifter import Lifter, lift_basic_block, detect_seh_helpers
+from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                     FIN_SETTER, _make_condition, _is_flag_consumer,
+                     _sets_flags)
 
 
 def _fixup_icall_esp_save(lines):
@@ -90,6 +93,184 @@ def _fixup_icall_esp_save(lines):
             result.append(f"{indent}}}")
 
     return result
+
+
+def _flag_key(state):
+    if state is None:
+        return None
+    setter, ops = state
+    if setter == FIN_SETTER:
+        return (setter, tuple(ops))
+    return (setter, tuple((o.type, o.reg, o.imm, o.mem_base, o.mem_index,
+                           o.mem_scale, o.mem_disp, o.mem_size, o.mem_segment)
+                          for o in ops))
+
+
+_FIN_NAME = re.compile(r"\b(_fin[0-9A-F]+)_(j[a-z]+)\b")
+
+
+def _incoming_flag_states(lifter, blocks, func_start):
+    """Flag state entering each block, taken from its real predecessors.
+
+    The translator used to hand every block the flags left by the block just
+    before it *in address order*. That is only a predecessor when it falls
+    through. MSVC threads jumps, so a jcc often starts a block whose only way
+    in is a branch from elsewhere:
+
+        184AB  test ebx, ebx
+        184AD  jge  184C5
+        184AF  ...            ; error path, ends in  jmp 18557
+        184C0  jmp  18557
+        184C5  je   18557     ; flags are test ebx,ebx's
+
+    The je was emitted as `if (esp == 0)` from the error path's `add esp, 4`,
+    so a zero-length decode was never skipped; EA's stream mixer then called
+    its float-to-PCM converter with a NULL destination and a pointer for a
+    count, which wrote 16-bit samples from address 0 upward across .text, the
+    kernel import table and .data. See RE_NOTES part 178.
+
+    A fixpoint over the CFG: a block's in-state is the common out-state of
+    its predecessors. Where they genuinely disagree -- MSVC tail-merges a jcc
+    that two different compares both reach:
+
+        32508  cmp eax, 3 / jl 32516 / cmp eax, 4 / 32510 jg 32516
+        324E6  cmp eax, 3 / jmp 32510
+
+    -- no single setter is right, so every predecessor evaluates the
+    conditions the block needs into `_finXXXX_jcc` locals just before it
+    leaves, and the block reads those. A block with no known predecessor
+    (switch-table target) starts unknown.
+
+    Returns (in_state, fin): fin maps a predecessor block start to the
+    statements it must run before its terminator.
+    """
+    preds = {bb.start: [] for bb in blocks}
+    for bb in blocks:
+        for s in bb.successors:
+            if s in preds and bb.start not in preds[s]:
+                preds[s].append(bb.start)
+
+    # Backward liveness of the flags across block boundaries: a block reads
+    # its incoming flags if a consumer comes before any setter, or if it sets
+    # none and a successor reads them. Only then does a setter whose operands
+    # are overwritten later in its block need a snapshot for the successor.
+    reads_in, passes = {}, {}
+    for bb in blocks:
+        r, p_ = False, True
+        for ins in bb.instructions:
+            if _is_flag_consumer(ins):
+                r = True
+                break
+            if _sets_flags(ins) or ins.is_call:
+                p_ = False
+                break
+        reads_in[bb.start], passes[bb.start] = r, p_
+    changed = True
+    while changed:
+        changed = False
+        for bb in blocks:
+            if reads_in[bb.start] or not passes[bb.start]:
+                continue
+            if any(reads_in.get(s) for s in bb.successors):
+                reads_in[bb.start] = True
+                changed = True
+    live = {bb.start: any(reads_in.get(s) for s in bb.successors)
+            for bb in blocks}
+
+    def lift(bb, st):
+        return lift_basic_block(lifter, bb, flag_state=st,
+                                live_out=live[bb.start])
+
+    def solve(forced):
+        out_state, in_state, conflicts = {}, {}, set()
+        for _ in range(len(blocks) + 2):
+            changed = False
+            for bb in blocks:
+                if bb.start in forced:
+                    st = (FIN_SETTER, [forced[bb.start]])
+                else:
+                    ps = [p for p in preds[bb.start] if p in out_state]
+                    if not ps:
+                        st = None
+                    else:
+                        keys = {_flag_key(out_state[p]) for p in ps}
+                        st = out_state[ps[0]]
+                        if len(keys) != 1:
+                            conflicts.add(bb.start)
+                in_state[bb.start] = st
+                _, out = lift(bb, st)
+                if (bb.start not in out_state
+                        or _flag_key(out_state[bb.start]) != _flag_key(out)):
+                    out_state[bb.start] = out
+                    changed = True
+            if not changed:
+                break
+        # A conflict seen mid-iteration may have resolved; keep only real ones.
+        real = set()
+        for c in conflicts:
+            ps = [p for p in preds[c] if p in out_state]
+            if len({_flag_key(out_state[p]) for p in ps}) > 1:
+                real.add(c)
+        return in_state, out_state, real
+
+    forced = {}
+    while True:
+        in_state, out_state, conflicts = solve(forced)
+        new = [c for c in conflicts if c not in forced]
+        if not new:
+            break
+        for c in new:
+            forced[c] = "_fin%X" % c
+
+    # Which materialised conditions are read, closed over predecessors whose
+    # own out-state is materialised.
+    prefix_block = {v: k for k, v in forced.items()}
+    needed = set()
+    for bb in blocks:
+        stmts, _ = lift(bb, in_state[bb.start])
+        needed |= set(_FIN_NAME.findall("\n".join(stmts)))
+    fin, unknown = {}, 0
+    work, done = list(needed), set()
+    while work:
+        prefix, m = work.pop()
+        if (prefix, m) in done or prefix not in prefix_block:
+            continue
+        done.add((prefix, m))
+        c = prefix_block[prefix]
+        for p in preds[c]:
+            st = out_state.get(p)
+            r = _make_condition(m, st[0], st[1]) if st else None
+            if r is None:
+                unknown += 1
+                line = (f"{prefix}_{m} = 0; /* flags for loc_{c:08X}: unknown "
+                        f"on the path from loc_{p:08X} */")
+            else:
+                line = (f"{prefix}_{m} = ({r[0]}) ? 1 : 0; "
+                        f"/* flags for loc_{c:08X} */")
+                for more in _FIN_NAME.findall(r[0]):
+                    work.append(more)
+            fin.setdefault(p, []).append(line)
+    for p in fin:
+        fin[p].sort()
+
+    stats = os.environ.get("XLIFT_FLAG_STATS")
+    if stats:
+        old, prev = {}, None
+        for bb in blocks:
+            old[bb.start] = prev
+            _, prev = lift(bb, prev)
+        changed_blocks = []
+        for bb in blocks:
+            a, _ = lift(bb, old[bb.start])
+            b, _ = lift(bb, in_state[bb.start])
+            if a != b:
+                changed_blocks.append(bb.start)
+        if changed_blocks or forced:
+            with open(stats, "a", encoding="utf-8") as f:
+                f.write("0x%08X changed=%s materialised=%s unknown=%d\n" % (
+                    func_start, ",".join("0x%X" % x for x in changed_blocks),
+                    ",".join("0x%X" % x for x in sorted(forced)), unknown))
+    return in_state, fin, live
 
 
 class FunctionTranslator:
@@ -218,20 +399,98 @@ class FunctionTranslator:
 
         # Ensure ebp tracked if function has tail jumps (lifter emits
         # g_seh_ebp = ebp before external jmp and indirect jmp).
+        #
+        # BUG (found on SSX Tricky, fixed alongside the matching lifter.py
+        # fix in _lift_jcc): this only checked unconditional `jmp`. A
+        # *conditional* jump to an external target (`je sub_XXXXX` etc.) is
+        # just as much a tail call, and _lift_jcc emits the identical
+        # `g_seh_ebp = ebp; target(); return;` pattern for it -- but without
+        # this check also covering conditional jumps, a function whose
+        # *only* external branch is conditional (has_tail_jump False, ebp
+        # otherwise unused) would never get `ebp` declared as a local at
+        # all, and the emitted `g_seh_ebp = ebp;` would reference an
+        # undeclared variable -- a compile error, not a silent bug, which
+        # is how this would have been caught immediately on the next full
+        # rebuild if left unfixed. See RE_NOTES_xboxrecomp_test.md,
+        # twenty-first follow-up.
         has_tail_jump = any(
-            insn.mnemonic == "jmp" and (
+            (insn.mnemonic == "jmp" or insn.is_cond_jump) and (
                 (insn.jump_target and not (start <= insn.jump_target < end))
-                or not insn.jump_target  # indirect jmp
+                or (not insn.jump_target and insn.mnemonic == "jmp")  # indirect jmp
             )
             for insn in instructions
         )
         if has_tail_jump:
             used_regs.add("ebp")
 
+        # Ensure ebp tracked if the function's last basic block "falls off
+        # the end" into whatever function starts right at its own end
+        # address, instead of terminating in a ret or an (already-handled)
+        # external jmp.
+        #
+        # BUG (found on SSX Tricky, fixed): build_basic_blocks() only
+        # records a fallthrough/branch successor when the target address is
+        # still inside [func_start, func_end) (see disasm.py's
+        # build_basic_blocks: the `if last.end_address < func_end` /
+        # `elif last.is_cond_jump` checks). When a function's real x86 code
+        # is a fall-through predecessor of a sibling function the detector
+        # split out right at this function's own end address -- a normal
+        # instruction, or the not-taken side of a conditional jump, whose
+        # natural continuation is func_end itself -- nothing records that
+        # edge, and nothing downstream ever emits a call into the sibling
+        # function for it. The lifter already has the exact right handling
+        # for this (see _lift_jmp's `_is_external_target` branch, used for
+        # explicit tail jmps); it just never gets *reached* for this case,
+        # because there's no explicit jmp instruction to trigger it. Confirmed
+        # against several real instances by disassembling the original bytes
+        # directly: the "next" instruction genuinely is the sibling
+        # function's first instruction, with no ret/jmp in between. Silently
+        # produces a function that returns without doing what the tail
+        # actually does -- for a callee-cleans-its-own-stack function
+        # (`ret N`), without popping N bytes; for a shared final-block
+        # fragment (`leave; ret`), without restoring esp/ebp at all -- which
+        # reliably corrupts the caller's stack on every single call through
+        # that path. See RE_NOTES_xboxrecomp_test.md in the SSX Tricky decomp
+        # project for the full diagnosis (sub_001544C3/sub_0015CAC7/
+        # CRT_ftol_TruncateToInt64/sub_0012A627/sub_00150DB0/sub_00150B39/
+        # sub_0015457F and the six sub_0015F07D callers, found and hand-fixed
+        # one at a time before this general fix; sub_0015457F specifically
+        # meant a whole game's heap arena was silently never allocated).
+        #
+        # Fix: after lifting all blocks, if the function's last block ends
+        # on something other than a ret or unconditional jmp (both already
+        # handled correctly) and that instruction's natural continuation
+        # reaches func_end, emit the same "call the sibling function; return"
+        # pattern _lift_jmp already uses for an explicit external tail jmp.
+        _last_block_falls_through_past_end = False
+        if blocks:
+            _last_insn_in_func = blocks[-1].last_insn
+            if (_last_insn_in_func is not None
+                    and not _last_insn_in_func.is_terminator
+                    and _last_insn_in_func.end_address >= end):
+                _last_block_falls_through_past_end = True
+        if _last_block_falls_through_past_end:
+            used_regs.add("ebp")
+
         # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
         # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x00244784, 0x002447BF}
-        if any(insn.call_target in SEH_FUNCS for insn in instructions):
+        #
+        # BUG (found on SSX Tricky, fixed): this used to be a hardcoded
+        # {0x00244784, 0x002447BF} -- Burnout 3's specific __SEH_prolog/
+        # __SEH_epilog addresses, left over from the tool's reference
+        # implementation. For any other game (SSX Tricky's real addresses
+        # are 0x0015DEBC/0x0015DEF5, dynamically detected and logged at
+        # startup as "SEH helpers: ..."), that hardcoded set never matches,
+        # so this used_regs.add("ebp") never fires even though the emission
+        # code below (which correctly uses the dynamically-detected
+        # self.lifter.SEH_PROLOG/SEH_EPILOG) still emits the "ebp = g_seh_ebp"
+        # readback line -- producing a declared-nowhere compile error
+        # ('ebp' undeclared) for any such function. Use the same
+        # dynamically-detected addresses the emission side already uses,
+        # instead of Burnout 3's hardcoded ones.
+        seh_funcs = {a for a in (getattr(self.lifter, "SEH_PROLOG", None),
+                                  getattr(self.lifter, "SEH_EPILOG", None)) if a is not None}
+        if any(insn.call_target in seh_funcs for insn in instructions):
             used_regs.add("ebp")
 
         # Build call targets list
@@ -267,6 +526,7 @@ class FunctionTranslator:
         # Function signature
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
+        body_decl_idx = len(lines)  # where late-discovered locals are declared
 
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
@@ -297,39 +557,60 @@ class FunctionTranslator:
         has_fpu_cmp = any(insn.mnemonic in ("fcompi", "fcomip", "fucomi",
                                              "fucompi", "fucomip", "fcomi",
                                              "fcom", "fcomp", "fcompp",
-                                             "fucom", "fucomp", "fucompp")
+                                             "fucom", "fucomp", "fucompp",
+                                             "ficom", "ficomp", "ftst",
+                                             "fnstsw", "fstsw", "fxam")
                           for insn in instructions)
         if has_fpu_cmp:
             lines.append(f"    int _fpu_cmp = 0; /* FPU compare result: -1/0/1 */")
 
-        # SSE/MMX register declarations
-        if used_xmm:
-            xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
-            mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
-                               and not r.startswith("xmm")])
-            if xmm_regs:
-                lines.append(f"    float {', '.join(xmm_regs)};")
-            if mmx_regs:
-                lines.append(f"    uint64_t {', '.join(mmx_regs)};")
+        # SSE/MMX registers are NOT declared here (part 182): xmm0-7 and
+        # mm0-7 are macros for the per-thread register files g_xmm / g_mm in
+        # recomp_types.h. Function-local copies lost every value live across
+        # a call, a tail jump or a fall-through into a split fragment -- the
+        # same defect the x87 stack had until part 179.
 
-        # FPU stack (simplified)
+        # FPU stack: the per-thread x87 register file. `_fp_stack`/`_fp_top`
+        # alias g_fp_stack/g_fp_top in recomp_types.h; a private copy per
+        # function lost every value live across a call or a function split
+        # (part 179: 104 fragments read a stack their predecessor filled).
         if has_fpu:
-            lines.append(f"    double _fp_stack[8];")
-            lines.append(f"    int _fp_top = 0;")
-            lines.append(f"    #define fp_push(v) (_fp_stack[--_fp_top & 7] = (v))")
+            lines.append(f"    #define fp_push(v) (_fp_stack[--_fp_top & 7] = (g_x87_st0 = (v)))")
             lines.append(f"    #define fp_pop() (_fp_top++)")
             lines.append(f"    #define fp_popp() (fp_pop())")
             lines.append(f"    #define fp_top() _fp_stack[_fp_top & 7]")
             lines.append(f"    #define fp_st1() _fp_stack[(_fp_top + 1) & 7]")
 
-        # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
-        # In x86, these functions inherit EBP from their caller (typically
-        # via a tail jump that shares the caller's frame). In our C translation,
-        # ebp is a local variable that would start uninitialized, causing
-        # crashes when the function reads MEM32(ebp + offset). The g_seh_ebp
-        # global bridges ebp across function boundaries.
-        if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
-            lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
+        # Any function that uses ebp: initialize the local from g_seh_ebp.
+        #
+        # BUG (found on SSX Tricky, fixed): this used to be gated on
+        # `frame_type == "fpo_leaf" and not has_prologue`, i.e. only
+        # functions that use ebp as inherited scratch *without* their own
+        # prologue got this seed. But a function *with* its own real
+        # `push ebp; mov ebp, esp` prologue (has_prologue=True) still needs
+        # it: the `push ebp` instruction's operand is the *caller's* ebp,
+        # read before this function's own frame is established -- and in
+        # this translation, ebp is a per-function C local that only ever
+        # gets a value from either that same seed or this function's own
+        # `mov ebp, esp` (which comes *after* the push). Excluding
+        # has_prologue functions meant that push captured whatever
+        # uninitialized garbage happened to be on the native C call stack
+        # at that point instead of the real caller's ebp -- silently
+        # corrupting what a later `pop ebp`/`leave` restores for the
+        # caller, and any MEM32(ebp + offset) read via a tail-call chain
+        # that carries the (garbage) value onward via `g_seh_ebp = ebp;`.
+        # Confirmed live on SSX Tricky: sub_0017FE15 (has_prologue=True,
+        # frame_type != fpo_leaf) pushed garbage that read as Xbox VA
+        # ~0x1541A9 several tail-calls later in sub_0017FE66, causing a
+        # `MEM32(that garbage + 0x9C)` read that itself produced another
+        # garbage pointer (0x78000000) and crashed on the next dereference
+        # -- see RE_NOTES_xboxrecomp_test.md, twentieth follow-up. Seeding
+        # ebp here is always correct regardless of frame_type/has_prologue:
+        # a function that reads ebp before writing it now gets the right
+        # value; a function that writes ebp before ever reading it (pure
+        # scratch use) just has the seed immediately overwritten.
+        if "ebp" in used_regs:
+            lines.append(f"    ebp = g_seh_ebp; /* inherit caller's frame */")
 
         lines.append(f"")
 
@@ -350,7 +631,7 @@ class FunctionTranslator:
                 for t in switch_targets:
                     label_addrs.add(t)
 
-        flag_state = None
+        in_states, fin, flags_live = _incoming_flag_states(self.lifter, blocks, start)
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -361,14 +642,51 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Propagate flag state from previous block (fallthrough path).
-            # This handles patterns like: test eax,eax / ja X / jb Y
-            # where jb uses the same flags as ja from the preceding block.
-            stmts, flag_state = lift_basic_block(
-                self.lifter, bb, flag_state=flag_state)
+            # A block that opens with a flag consumer (test eax,eax / ja X /
+            # jb Y -- the jb reuses ja's flags) takes them from its real
+            # predecessors, not from whichever block precedes it in address
+            # order; see _incoming_flag_states.
+            stmts, _ = lift_basic_block(
+                self.lifter, bb, flag_state=in_states.get(bb.start),
+                live_out=flags_live.get(bb.start, True))
+            if bb.start in fin:
+                # Before the terminator: the flags and their operands are
+                # still the ones this block leaves with.
+                last = bb.instructions[-1] if bb.instructions else None
+                at = (len(stmts) - 1 if last is not None and stmts
+                      and (last.is_jump or last.is_cond_jump) else len(stmts))
+                stmts = stmts[:at] + fin[bb.start] + stmts[at:]
             for stmt in stmts:
                 lines.append(f"    {stmt}")
 
+            lines.append(f"")
+
+        # Flag-operand snapshots (lifter._emit_flag_snapshot) are only known
+        # once the body is lifted, so declare them now if any were used.
+        if any("_fsa" in l or "_fsb" in l for l in lines[body_decl_idx:]):
+            lines.insert(body_decl_idx,
+                         "    uint32_t _fsa = 0, _fsb = 0; "
+                         "/* flag-operand snapshots */")
+        fin_names = sorted({"%s_%s" % t for l in lines[body_decl_idx:]
+                            for t in _FIN_NAME.findall(l)})
+        if fin_names:
+            lines.insert(body_decl_idx,
+                         "    int " + ", ".join(n + " = 0" for n in fin_names)
+                         + "; /* conditions from disagreeing predecessors */")
+
+        # Emit the missing fall-through-into-sibling-function link detected
+        # above, using the exact same pattern _lift_jmp uses for an explicit
+        # external tail jmp. This is what real x86 execution does here: fall
+        # straight through into the next function's first instruction with
+        # no call/ret boundary, so from the callee's perspective this reads
+        # exactly like a tail call into it.
+        if _last_block_falls_through_past_end:
+            _fallthrough_name = self.lifter._call_target_name(end)
+            lines.append(
+                f"    g_seh_ebp = ebp; {_fallthrough_name}(); return; "
+                f"/* implicit fall-through into 0x{end:08X} (no ret/jmp here in "
+                f"the original bytes -- this function's real code just "
+                f"continues directly into the next one) */")
             lines.append(f"")
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
@@ -424,6 +742,25 @@ class FunctionTranslator:
 
         lines.append(f"}}")
         lines.append(f"")
+
+        # Publish ebp before every call. A callee seeds its own ebp from
+        # g_seh_ebp ("inherit caller's frame" above), which only holds the
+        # caller's ebp if the caller wrote it -- tail jumps did, calls never
+        # did. On hardware the callee always sees the caller's EBP; here a
+        # fragment such as the CRT's atan2 classifier (0x0015EED3, reached by
+        # `call` from the dispatcher at 0x0015F33B) read a stale frame: its
+        # `fldcw [ebp-0xA2]` loaded garbage and its fxam results landed in
+        # the wrong slots. That made atan2/acos return NaN, the race camera
+        # went NaN and the course never drew (part 180).
+        if "ebp" in used_regs:
+            call_rx = re.compile(r"^(\s*(?:\{ uint32_t _icall_esp = g_esp;\s*)?)"
+                                  r"(PUSH32\(esp, 0\); (?:\w+\(\)|RECOMP_ICALL))")
+            for i, ln in enumerate(lines):
+                if "g_seh_ebp = ebp" in ln:
+                    continue
+                m = call_rx.match(ln)
+                if m:
+                    lines[i] = m.group(1) + "g_seh_ebp = ebp; " + ln[len(m.group(1)):]
 
         return "\n".join(lines)
 
@@ -857,7 +1194,11 @@ class BatchTranslator:
             f"static const recomp_entry_t g_recomp_table[] = {{",
         ]
 
-        for addr, name, _ in translations:
+        # recomp_lookup binary-searches this table, so it must be emitted
+        # in ascending address order. It was not, and a binary search over
+        # an unsorted array fails silently -- it reports "not found" for
+        # entries it steps past. Forty functions were unreachable that way.
+        for addr, name, _ in sorted(translations, key=lambda t: t[0]):
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
 
         lines.extend([

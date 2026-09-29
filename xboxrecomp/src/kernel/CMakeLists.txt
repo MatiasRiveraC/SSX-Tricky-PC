@@ -10,6 +10,7 @@ set(KERNEL_SOURCES
     kernel_rtl.c
     kernel_memory.c
     kernel_file.c
+    xbox_xdvdfs.c
     kernel_thread.c
     kernel_sync.c
     kernel_hal.c
@@ -20,6 +21,8 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_memory_layout.c
+    xbox_diag.c
+    xbox_profile.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -36,7 +39,7 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt ws2_32 psapi xbox_nv2a)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)

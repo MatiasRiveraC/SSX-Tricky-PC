@@ -127,6 +127,9 @@ static const char g_vs_source[] =
     "        o.pos.w = 1.0;\n"
     "        o.diffuse = (Flags & FLAG_HAS_DIFFUSE) ? input.diffuse.bgra : float4(1,1,1,1);\n"
     "        if (Flags & FLAG_HAS_SPECULAR) o.specular = input.specular.bgra;\n"
+    /* D3D: a pre-transformed vertex carries its fog factor in specular
+     * alpha (the NV2A program path puts oFog's result there). */
+    "        if (Flags & FLAG_HAS_SPECULAR) o.fog = input.specular.a;\n"
     "        return o;\n"
     "    }\n"
     "\n"
@@ -753,6 +756,18 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
             cb->screen_w = (float)d3d8_GetBackbufferWidth();
             cb->screen_h = (float)d3d8_GetBackbufferHeight();
             cb->flags = 0x01; /* pre-transformed */
+            {
+                /* A zero ScreenSize would divide every position into inf/NaN,
+                 * which the rasteriser discards silently -- exactly the
+                 * symptom under investigation. Report what is actually sent. */
+                static int told = 0;
+                if (!told) {
+                    told = 1;
+                    fprintf(stderr, "  [D3D] VS CB (pretransformed): screen=%.1fx%.1f flags=0x%X\n",
+                            cb->screen_w, cb->screen_h, (unsigned)cb->flags);
+                    fflush(stderr);
+                }
+            }
         } else {
             float wv[16], wvp[16], wvp_t[16], world_t[16];
             float world_inv[16], world_inv_t[16];
@@ -919,19 +934,38 @@ void d3d8_shaders_prepare_draw(DWORD fvf)
                 continue;
             }
 
-            DWORD colorop = tss[D3DTSS_COLOROP];
-            if (colorop == 0) colorop = (stage == 0) ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+            /* Read the table straight. It is seeded with the D3D8 documented
+             * defaults at device creation, so a zero here is a real value, not
+             * an unset one. The previous `tss[X] ? tss[X] : DEFAULT` form could
+             * not represent D3DTA_DIFFUSE at all -- it is 0 -- so a stage set to
+             * take vertex colour silently became D3DTA_TEXTURE and sampled an
+             * unbound texture, which is transparent black. That is why nothing
+             * the translator drew ever appeared. */
+            pc->stage_color[stage][0] = tss[D3DTSS_COLOROP];
+            pc->stage_color[stage][1] = tss[D3DTSS_COLORARG1];
+            pc->stage_color[stage][2] = tss[D3DTSS_COLORARG2];
+            pc->stage_color[stage][3] = tss[D3DTSS_ALPHAOP];
 
-            pc->stage_color[stage][0] = colorop;
-            pc->stage_color[stage][1] = tss[D3DTSS_COLORARG1] ? tss[D3DTSS_COLORARG1] : D3DTA_TEXTURE;
-            pc->stage_color[stage][2] = tss[D3DTSS_COLORARG2] ? tss[D3DTSS_COLORARG2] : D3DTA_CURRENT;
-            pc->stage_color[stage][3] = tss[D3DTSS_ALPHAOP] ? tss[D3DTSS_ALPHAOP] :
-                                         (stage == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE);
-
-            pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1] ? tss[D3DTSS_ALPHAARG1] : D3DTA_TEXTURE;
-            pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2] ? tss[D3DTSS_ALPHAARG2] : D3DTA_CURRENT;
+            pc->stage_alpha[stage][0] = tss[D3DTSS_ALPHAARG1];
+            pc->stage_alpha[stage][1] = tss[D3DTSS_ALPHAARG2];
         }
 
+        {
+            /* ps_flags bit 0 with alpha_func == 1 (D3DCMP_NEVER) discards every
+             * pixel, which looks identical to a draw that never happened. Report
+             * the values actually sent, plus stage 0, whose colorop decides
+             * whether the stage loop runs at all. */
+            static int told = 0;
+            if (!told) {
+                told = 1;
+                fprintf(stderr, "  [D3D] PS CB: ps_flags=0x%X alpha_func=%u alpha_ref=%.3f"
+                                " | stage0 colorop=%u arg1=%u arg2=%u alphaop=%u\n",
+                        (unsigned)pc->ps_flags, (unsigned)pc->alpha_func, pc->alpha_ref,
+                        (unsigned)pc->stage_color[0][0], (unsigned)pc->stage_color[0][1],
+                        (unsigned)pc->stage_color[0][2], (unsigned)pc->stage_color[0][3]);
+                fflush(stderr);
+            }
+        }
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_ps_cb, 0);
     }
 

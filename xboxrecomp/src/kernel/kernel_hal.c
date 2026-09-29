@@ -12,8 +12,11 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #if defined(_WIN32)
 #include <intrin.h>
+#include <stdio.h>
+#include <stddef.h>
 #endif
 
 /* ============================================================================
@@ -32,6 +35,49 @@
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
 /*
+ * Publish the tracked IRQL into the calling thread's KPCR at +0x24.
+ *
+ * Guest code does not always go through these exports: the CRT reads the
+ * field directly (`movzx eax, fs:[0x24]` in _getptd) and bugchecks if it sees
+ * >= 2. Keeping it in a C variable alone meant the two could never agree, so
+ * whatever happened to be in that byte was what the title acted on.
+ * See RE_NOTES part 146.
+ */
+static void publish_irql(KIRQL level)
+{
+    extern __thread uint32_t g_xbox_tib_va;
+    extern ptrdiff_t g_xbox_mem_offset;
+    if (g_xbox_tib_va)
+        *(volatile unsigned char *)((uintptr_t)(g_xbox_tib_va + XBOX_KPCR_IRQL)
+                                    + g_xbox_mem_offset) = (unsigned char)level;
+}
+
+/*
+ * An IRQL above HIGH_LEVEL (31) cannot exist. Seeing one means the fastcall
+ * argument in cl was never set by the translated caller and carries stack
+ * debris -- which then sits in KPCR.Irql until something bugchecks on it
+ * (IRQL_NOT_LESS_OR_EQUAL, part 177: 192 on the main thread). Report the host
+ * frames, which addr2line resolves to the generated caller, once per level.
+ */
+static void irql_report_impossible(const char *what, KIRQL level, KIRQL prev)
+{
+    static volatile LONG seen[256];
+    void *frames[16];
+    USHORT n, i;
+    HMODULE self = GetModuleHandleA(NULL);
+    if (InterlockedExchange(&seen[level], 1)) return;
+    fprintf(stderr, "[IRQL] %s(%u) from %u -- impossible level; host frames:\n",
+            what, (unsigned)level, (unsigned)prev);
+    n = CaptureStackBackTrace(1, 16, frames, NULL);
+    for (i = 0; i < n; i++) {
+        uintptr_t rva = (uintptr_t)frames[i] - (uintptr_t)self;
+        if (rva < 0x08000000u)
+            fprintf(stderr, "    0x%09llX\n", (unsigned long long)(0x140000000ull + rva));
+    }
+    fflush(stderr);
+}
+
+/*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
  */
@@ -39,6 +85,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
     KIRQL old = g_current_irql;
 
+    if (NewIrql > HIGH_LEVEL) irql_report_impossible("KfRaiseIrql", NewIrql, old);
     if (NewIrql < old) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfRaiseIrql: attempt to lower IRQL from %d to %d (use KfLowerIrql)",
@@ -46,6 +93,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
     }
 
     g_current_irql = NewIrql;
+    publish_irql(NewIrql);
     return old;
 }
 
@@ -55,6 +103,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
+    if (NewIrql > HIGH_LEVEL) irql_report_impossible("KfLowerIrql", NewIrql, g_current_irql);
     if (NewIrql > g_current_irql) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
@@ -62,6 +111,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     }
 
     g_current_irql = NewIrql;
+    publish_irql(NewIrql);
 }
 
 /*
@@ -71,6 +121,7 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
     g_current_irql = DISPATCH_LEVEL;
+    publish_irql(DISPATCH_LEVEL);
     return old;
 }
 
@@ -176,10 +227,55 @@ NTSTATUS __stdcall xbox_KeRestoreFloatingPointState(PVOID FloatingPointState)
  * recompilation, we log the error and terminate the process.
  * ============================================================================ */
 
+/*
+ * A bugcheck is the title telling us it has hit a fatal error, and it is the
+ * one failure that used to leave nothing behind: the process exits with the
+ * bugcheck code and no indication of where it came from, so a run that ended
+ * at exit=10 looked identical to a clean shutdown. Print the guest label and
+ * the host frames, which addr2line turns into the guest function that called
+ * it. Written to stderr as well as the kernel log, because the log is easy to
+ * forget and this is the last thing the process does.
+ */
+static void bugcheck_context(const char *what, ULONG code)
+{
+    extern volatile unsigned g_last_loc;
+    void *frames[24];
+    USHORT n, i;
+    HMODULE self = GetModuleHandleA(NULL);
+
+    fprintf(stderr, "BUGCHECK: %s code=0x%08X, last guest label loc_%08X\n",
+            what, (unsigned)code, g_last_loc);
+    /* IRQL_NOT_LESS_OR_EQUAL (0x0A) is raised by guest code that read
+     * KPCR.Irql through fs:[0x24] and found >= DISPATCH_LEVEL. Say what it
+     * read and where from: a thread with no TIB of its own resolves fs:[n]
+     * into guest page 0, and there the "IRQL" is whatever that page holds. */
+    {
+        extern __thread uint32_t g_xbox_tib_va;
+        extern ptrdiff_t g_xbox_mem_offset;
+        unsigned char seen = *(volatile unsigned char *)
+            ((uintptr_t)(g_xbox_tib_va + XBOX_KPCR_IRQL) + g_xbox_mem_offset);
+        fprintf(stderr, "BUGCHECK: host tid %lu, TIB/KPCR at VA 0x%08X%s, "
+                "fs:[0x24] reads %u, tracked IRQL %u\n",
+                GetCurrentThreadId(), g_xbox_tib_va,
+                g_xbox_tib_va ? "" : " (NONE -- shared page-0 fallback)",
+                (unsigned)seen, (unsigned)g_current_irql);
+    }
+    n = CaptureStackBackTrace(0, 24, frames, NULL);
+    fprintf(stderr, "BUGCHECK: host frames (link addrs for addr2line):\n");
+    for (i = 0; i < n; i++) {
+        uintptr_t rva = (uintptr_t)frames[i] - (uintptr_t)self;
+        if (rva < 0x08000000u)
+            fprintf(stderr, "    0x%09llX\n",
+                    (unsigned long long)(0x140000000ull + rva));
+    }
+    fflush(stderr);
+}
+
 VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheck: code=0x%08X ***", BugCheckCode);
+    bugcheck_context("KeBugCheck", BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
@@ -198,6 +294,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheckEx: code=0x%08X, params=(0x%p, 0x%p, 0x%p, 0x%p) ***",
         BugCheckCode, (void*)Param1, (void*)Param2, (void*)Param3, (void*)Param4);
+    bugcheck_context("KeBugCheckEx", BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();

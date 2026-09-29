@@ -88,8 +88,10 @@ extern ptrdiff_t g_xbox_mem_offset;
  * NOT global: ebp - stays local in each function because FPO
  * functions use it as scratch. For SEH, g_seh_ebp bridges the gap.
  */
-extern uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern uint32_t g_ebx, g_esi, g_edi;
+/* Thread-local: each real Xbox thread (see bridge_PsCreateSystemThreadEx) gets its own
+ * independent register state -- see the definition in xbox_memory_layout.c for why. */
+extern __thread uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern __thread uint32_t g_ebx, g_esi, g_edi;
 
 /**
  * SEH frame pointer bridge.
@@ -99,7 +101,7 @@ extern uint32_t g_ebx, g_esi, g_edi;
  * The prolog writes g_seh_ebp, and the caller reads it after the call.
  * Similarly, __SEH_epilog reads g_seh_ebp at entry and writes it at exit.
  */
-extern uint32_t g_seh_ebp;
+extern __thread uint32_t g_seh_ebp;
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -129,13 +131,44 @@ void recomp_icall_fail_log(uint32_t va);
  * ================================================================ */
 
 /**
+ * Real Xbox hardware maps physical RAM twice: once at 0x00000000
+ * (normal, cached) and again at 0x80000000 (uncached -- the top address
+ * bit disables the CPU cache for that access). Drivers use the uncached
+ * alias for writes that must be immediately visible to the GPU (which
+ * reads RAM directly, bypassing the CPU cache), typically followed by a
+ * wbinvd to flush anything still dirty in cache back to the cached view.
+ * Confirmed as genuine, deliberate Xbox driver behavior (not a bug) by
+ * disassembling real D3D8 driver bytes: `mov dword ptr [0x80000000], edx`
+ * immediately followed by `wbinvd`.
+ *
+ * We don't have a real CPU cache to bypass, and modeling this via actual
+ * OS-level address-space aliasing (a second MapViewOfFileEx at native
+ * address base+0x80000000) is fragile -- that fixed native address can
+ * collide with whatever else Windows/ASLR has already placed in the
+ * process's address space, and then fails unpredictably per-machine.
+ * Resolving the alias here instead, by masking off the top bit before
+ * translating, works unconditionally: Xbox VA 0x80000000+k always reads
+ * and writes the exact same memory as Xbox VA k, with no dependency on
+ * OS memory layout at all. Restricted to the real hardware's 64 MB
+ * window (0x80000000-0x83FFFFFF) so it can't accidentally swallow
+ * unrelated high addresses (e.g. the GPU MMIO aperture at 0xFD000000).
+ */
+static inline uint32_t xbox_resolve_uncached_alias(uint32_t va) {
+    if (va >= 0x80000000u && va < 0x84000000u) {
+        return va & 0x7FFFFFFFu;
+    }
+    return va;
+}
+
+/**
  * Translate an Xbox VA to an actual pointer.
  * Mask to 32-bit first: Xbox addresses are 32-bit and arithmetic
  * in the recompiled code can overflow. Without the mask, a 64-bit
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
-#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#define XBOX_PTR(addr) \
+    ((uintptr_t)xbox_resolve_uncached_alias((uint32_t)(addr)) + g_xbox_mem_offset)
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
@@ -150,6 +183,25 @@ void recomp_icall_fail_log(uint32_t va);
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+
+/**
+ * x86 port I/O (in/out instructions).
+ *
+ * Unlike MEM8/MEM32, ports have no address-space representation to map --
+ * each one is real hardware behavior that has to be modeled explicitly.
+ * Dispatched to xbox_io_port_read/write (kernel_bridge.c), which know the
+ * handful of ports actually hit in practice (e.g. 0x80C0, the Xbox ACPI
+ * GPIO block's TV-encoder field-pin bit) and return 0 / no-op for anything
+ * else -- the same "nothing here" behavior real unpopulated I/O space has.
+ */
+uint32_t xbox_io_port_read(uint16_t port, int width);
+void     xbox_io_port_write(uint16_t port, int width, uint32_t value);
+#define XBOX_IO_READ8(port)         ((uint8_t)xbox_io_port_read((uint16_t)(port), 1))
+#define XBOX_IO_READ16(port)        ((uint16_t)xbox_io_port_read((uint16_t)(port), 2))
+#define XBOX_IO_READ32(port)        (xbox_io_port_read((uint16_t)(port), 4))
+#define XBOX_IO_WRITE8(port, val)   xbox_io_port_write((uint16_t)(port), 1, (uint8_t)(val))
+#define XBOX_IO_WRITE16(port, val)  xbox_io_port_write((uint16_t)(port), 2, (uint16_t)(val))
+#define XBOX_IO_WRITE32(port, val)  xbox_io_port_write((uint16_t)(port), 4, (uint32_t)(val))
 
 /* ================================================================
  * Flag computation helpers

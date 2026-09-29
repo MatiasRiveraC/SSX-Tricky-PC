@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,20 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);
+
+/* Bring the APU up and trap its MMIO aperture (0xFE800000, 512 KB) so its
+ * registers get device behaviour instead of reading back as the plain RAM the
+ * aperture is otherwise mapped as. DSOUND writes the voice-processor setup and
+ * then waits on a status counter; backed by RAM that counter never advances.
+ * Returns false if the aperture could not be guarded. */
+bool apu_mmio_install(uint8_t *mem_base);
+
+#ifdef _WIN32
+#include <windows.h>
+/* Service a faulting APU access; advances Rip on success. */
+bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                          uint32_t fault_xbox_va, int is_write);
+#endif
 
 /* MMIO read from APU register space (addr is offset from 0xFE800000). */
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);

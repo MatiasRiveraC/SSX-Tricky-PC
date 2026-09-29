@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #include <malloc.h>
 
 /* ============================================================================
@@ -123,24 +124,26 @@ VOID __stdcall xbox_MmFreeSystemMemory(PVOID BaseAddress, ULONG NumberOfBytes)
 
 NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
 {
-    MEMORYSTATUSEX ms;
-    ms.dwLength = sizeof(ms);
-
     if (!MemoryStatistics)
         return STATUS_INVALID_PARAMETER;
-
-    if (!GlobalMemoryStatusEx(&ms))
-        return STATUS_UNSUCCESSFUL;
 
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* Report this port's *real, live* heap accounting -- not the host PC's
+     * free RAM (which is always vastly larger and has nothing to do with
+     * what's actually left in this bump allocator) and not a hardcoded
+     * 64MB total that doesn't even match this port's own, larger
+     * XBOX_TOTAL_RAM. A title that sizes a bulk allocation off this report
+     * needs the number to reflect what xbox_HeapAlloc will actually still
+     * grant it; see xbox_HeapGetStats's own comment for the bug this
+     * replaced. */
+    uint32_t used = 0, total = 0;
+    xbox_HeapGetStats(&used, &total);
+
     ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
-    MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
-    if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
-        MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
+    MemoryStatistics->TotalPhysicalPages = total / page_size;
+    MemoryStatistics->AvailablePages = (total > used) ? (total - used) / page_size : 0;
 
     return STATUS_SUCCESS;
 }

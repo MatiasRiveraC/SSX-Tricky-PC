@@ -330,6 +330,17 @@ class FunctionDetector:
         if next_func and next_func < upper:
             upper = next_func
 
+        # Forward branch targets seen but not yet decoded. Kept apart from
+        # max_addr, which is an *exclusive* end: conflating the two made a
+        # branch to exactly the end look like it had already been covered,
+        # so a function whose fall-through path returns and whose cold path
+        # sits after that `ret` -- ordinary MSVC layout -- was cut at the
+        # `ret`. The tail then became a separate function, and because these
+        # are FPO frames sharing one `esp`-relative locals block, the split
+        # shifted every `[esp+N]` in the tail by the tail call's pushed
+        # return address. That is what wrecked sub_00147000 (part 145).
+        pending = set()
+
         while addr < upper:
             insn = self.engine.get_instruction(addr)
             if insn is None:
@@ -339,19 +350,18 @@ class FunctionDetector:
             if end > max_addr:
                 max_addr = end
 
-            # Track internal forward jumps to extend function bounds
             if insn.is_cond_jump and insn.jump_target is not None:
                 target = insn.jump_target
-                if start <= target < upper and target > max_addr:
-                    # This jump goes forward within bounds, extend
-                    max_addr = target
+                if start <= target < upper:
+                    pending.add(target)
 
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
-                # Check if we've covered all internal jump targets
-                if addr + insn.size >= max_addr:
+                nxt = min((t for t in pending if t >= insn.end_address),
+                          default=None)
+                if nxt is None:
                     break
-                # There might be more code after (jumped over)
-                addr = insn.end_address
+                # Code the fall-through jumped over: keep going from there.
+                addr = nxt
                 continue
 
             addr = insn.end_address

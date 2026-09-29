@@ -28,6 +28,23 @@ static DWORD g_last_blend_hash = 0;
 static DWORD g_last_ds_hash = 0;
 static DWORD g_last_raster_hash = 0;
 
+/* NV2A window clip as a scissor rectangle (part 182). The frontend draws with
+ * the window clip set to the TV-safe area (30..609 x 22..457) and clears with
+ * it set to the whole surface; the translator reports a single inclusive
+ * rectangle here, and every draw that goes through d3d8_states_apply (the
+ * 2D path and the program path) is scissored to it. Clears and the video
+ * framebuffer copy are not draws, so they are unaffected, as on hardware. */
+static int        g_wclip_on;
+static D3D11_RECT g_wclip;
+
+void d3d8_SetWindowClip(int on, long x0, long y0, long x1, long y1)
+{
+    g_wclip_on = on;
+    g_wclip.left = x0; g_wclip.top = y0; g_wclip.right = x1; g_wclip.bottom = y1;
+}
+
+int d3d8_WindowClipOn(void) { return g_wclip_on; }
+
 /* ================================================================
  * D3D8 → D3D11 enum translation
  * ================================================================ */
@@ -92,31 +109,42 @@ static D3D11_BLEND_OP d3d8_to_d3d11_blendop(DWORD op)
     }
 }
 
-/* Simple hash of relevant render state values for dirty detection */
+/* Hash of the render states each D3D11 state object is built from, for dirty
+ * detection. Part 182: these were XORs of shifted values, which collide (and
+ * the depth-stencil one left out the stencil ops and write mask, so a change
+ * of op alone reused the old state object). FNV-1a over every input. */
+static DWORD hash_states(const DWORD *rs, const int *idx, int n)
+{
+    DWORD h = 2166136261u;
+    int i;
+    for (i = 0; i < n; i++) {
+        DWORD v = rs[idx[i]];
+        int k;
+        for (k = 0; k < 4; k++) { h ^= (v >> (8 * k)) & 0xFF; h *= 16777619u; }
+    }
+    return h;
+}
+
 static DWORD hash_blend_states(const DWORD *rs)
 {
-    return rs[D3DRS_ALPHABLENDENABLE] ^
-           (rs[D3DRS_SRCBLEND] << 4) ^
-           (rs[D3DRS_DESTBLEND] << 8) ^
-           (rs[D3DRS_BLENDOP] << 12) ^
-           (rs[D3DRS_COLORWRITEENABLE] << 16);
+    static const int idx[] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+                               D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE };
+    return hash_states(rs, idx, (int)(sizeof idx / sizeof idx[0]));
 }
 
 static DWORD hash_ds_states(const DWORD *rs)
 {
-    return rs[D3DRS_ZENABLE] ^
-           (rs[D3DRS_ZWRITEENABLE] << 2) ^
-           (rs[D3DRS_ZFUNC] << 4) ^
-           (rs[D3DRS_STENCILENABLE] << 8) ^
-           (rs[D3DRS_STENCILFUNC] << 10) ^
-           (rs[D3DRS_STENCILREF] << 14) ^
-           (rs[D3DRS_STENCILMASK] << 18);
+    static const int idx[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC,
+                               D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
+                               D3DRS_STENCILWRITEMASK, D3DRS_STENCILFAIL, D3DRS_STENCILZFAIL,
+                               D3DRS_STENCILPASS };
+    return hash_states(rs, idx, (int)(sizeof idx / sizeof idx[0]));
 }
 
 static DWORD hash_raster_states(const DWORD *rs)
 {
-    return rs[D3DRS_CULLMODE] ^
-           (rs[D3DRS_FILLMODE] << 4);
+    static const int idx[] = { D3DRS_CULLMODE, D3DRS_FILLMODE };
+    return hash_states(rs, idx, (int)(sizeof idx / sizeof idx[0]));
 }
 
 /* ================================================================
@@ -188,7 +216,7 @@ static void update_depth_stencil_state(const DWORD *rs)
 
 static void update_rasterizer_state(const DWORD *rs)
 {
-    DWORD hash = hash_raster_states(rs);
+    DWORD hash = hash_raster_states(rs) ^ (g_wclip_on ? 0x9E3779B9u : 0u);
     D3D11_RASTERIZER_DESC rd;
     HRESULT hr;
 
@@ -217,7 +245,7 @@ static void update_rasterizer_state(const DWORD *rs)
 
     rd.FrontCounterClockwise = FALSE;
     rd.DepthClipEnable = TRUE;
-    rd.ScissorEnable = FALSE;
+    rd.ScissorEnable = g_wclip_on ? TRUE : FALSE;
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
 
@@ -244,25 +272,30 @@ static D3D11_TEXTURE_ADDRESS_MODE d3d8_to_d3d11_address(DWORD mode)
 
 static D3D11_FILTER d3d8_to_d3d11_filter(DWORD mag, DWORD min, DWORD mip)
 {
-    /* Simplified filter mapping */
     BOOL mag_linear = (mag == D3DTEXF_LINEAR || mag == D3DTEXF_ANISOTROPIC);
     BOOL min_linear = (min == D3DTEXF_LINEAR || min == D3DTEXF_ANISOTROPIC);
     BOOL mip_linear = (mip == D3DTEXF_LINEAR);
 
     if (mag == D3DTEXF_ANISOTROPIC || min == D3DTEXF_ANISOTROPIC)
         return D3D11_FILTER_ANISOTROPIC;
-
-    if (min_linear && mag_linear && mip_linear)
-        return D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    if (min_linear && mag_linear)
-        return D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-    if (min_linear)
-        return D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT;
-    if (mag_linear)
-        return D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
-
-    return D3D11_FILTER_MIN_MAG_MIP_POINT;
+    /* D3D11_FILTER spells the three choices as bits: min 0x10, mag 0x04,
+     * mip 0x01 (linear when set). The old table had five of the eight, and
+     * none with a linear mip, which only mattered once mipmaps existed. */
+    return (D3D11_FILTER)((min_linear ? 0x10 : 0) | (mag_linear ? 0x04 : 0) |
+                          (mip_linear ? 0x01 : 0));
 }
+
+/* Anisotropic filtering chosen by the player (part 183): 0 = the title's own
+ * filtering; 2..16 = anisotropic for every texture the title filters
+ * linearly. Point-sampled textures (pixel fonts) are left alone. */
+static int g_host_aniso = 0;
+
+void d3d8_SetAnisotropy(int n)
+{
+    g_host_aniso = (n == 2 || n == 4 || n == 8 || n == 16) ? n : 0;
+}
+
+int d3d8_GetAnisotropy(void) { return g_host_aniso; }
 
 void d3d8_states_apply_sampler(DWORD stage)
 {
@@ -270,6 +303,8 @@ void d3d8_states_apply_sampler(DWORD stage)
     D3D11_SAMPLER_DESC sd;
     HRESULT hr;
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    union { DWORD u; float f; } bias;
+    UINT aniso;
 
     if (stage >= 4) return;
     tss = d3d8_GetTSS(stage);
@@ -289,12 +324,44 @@ void d3d8_states_apply_sampler(DWORD stage)
     sd.AddressU = d3d8_to_d3d11_address(tss[D3DTSS_ADDRESSU] ? tss[D3DTSS_ADDRESSU] : D3DTADDRESS_WRAP);
     sd.AddressV = d3d8_to_d3d11_address(tss[D3DTSS_ADDRESSV] ? tss[D3DTSS_ADDRESSV] : D3DTADDRESS_WRAP);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
-    sd.MaxAnisotropy = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
+    aniso = tss[D3DTSS_MAXANISOTROPY] ? tss[D3DTSS_MAXANISOTROPY] : 1;
+    if (aniso > 16) aniso = 16;
+    /* Anisotropic when the title asks for more than 1x (NV2A CONTROL0, as
+     * xemu applies it) or the player chose it, for linearly filtered
+     * textures; the larger of the two wins. */
+    if ((g_host_aniso > 1 || aniso > 1) && tss[D3DTSS_MINFILTER] != D3DTEXF_POINT &&
+        tss[D3DTSS_MINFILTER] != D3DTEXF_NONE) {
+        sd.Filter = D3D11_FILTER_ANISOTROPIC;
+        if ((UINT)g_host_aniso > aniso) aniso = (UINT)g_host_aniso;
+    }
+    sd.MaxAnisotropy = aniso;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    /* Mipmaps (part 183): the most detailed level allowed, the bias, and --
+     * with no mip filter -- the base level only. */
+    bias.u = tss[D3DTSS_MIPMAPLODBIAS];
+    sd.MipLODBias = (bias.f == bias.f && bias.f > -16.0f && bias.f < 16.0f) ? bias.f : 0.0f;
+    sd.MinLOD = (FLOAT)tss[D3DTSS_MAXMIPLEVEL];
+    sd.MaxLOD = (tss[D3DTSS_MIPFILTER] == D3DTEXF_NONE) ? sd.MinLOD : D3D11_FLOAT32_MAX;
 
-    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_sampler_states[stage]);
-    if (SUCCEEDED(hr)) {
+    /* Sampler objects, kept by description (part 183): creating one per
+     * stage per draw cost a trip into the runtime every time, even though it
+     * hands back the same object for the same description. */
+    {
+        #define SAMPLER_CACHE 256
+        static struct { D3D11_SAMPLER_DESC d; ID3D11SamplerState *s; } cache[SAMPLER_CACHE];
+        static int ncache = 0;
+        int k;
+        for (k = 0; k < ncache; k++)
+            if (!memcmp(&cache[k].d, &sd, sizeof sd)) break;
+        if (k == ncache) {
+            ID3D11SamplerState *ss = NULL;
+            hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &ss);
+            if (FAILED(hr) || !ss) return;
+            if (ncache < SAMPLER_CACHE) { cache[k].d = sd; cache[k].s = ss; ncache++; }
+            else { g_sampler_states[stage] = ss; ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &ss); return; }
+        }
+        g_sampler_states[stage] = cache[k].s;
+        ID3D11SamplerState_AddRef(cache[k].s);   /* released on the next apply, as before */
         ID3D11DeviceContext_PSSetSamplers(ctx, stage, 1, &g_sampler_states[stage]);
     }
 }
@@ -344,6 +411,18 @@ void d3d8_states_apply(void)
         ID3D11DeviceContext_OMSetDepthStencilState(ctx, g_ds_state, rs[D3DRS_STENCILREF]);
     if (g_raster_state)
         ID3D11DeviceContext_RSSetState(ctx, g_raster_state);
+    if (g_wclip_on) {
+        /* The clip is in the title's 640x480 pixels; the scene target may be
+         * larger (part 183). Scale 1 leaves it exactly as given. */
+        D3D11_RECT r;
+        float sx, sy;
+        d3d8_GetGuestScale(&sx, &sy);
+        r.left   = (LONG)(g_wclip.left   * sx + 0.5f);
+        r.top    = (LONG)(g_wclip.top    * sy + 0.5f);
+        r.right  = (LONG)(g_wclip.right  * sx + 0.5f);
+        r.bottom = (LONG)(g_wclip.bottom * sy + 0.5f);
+        ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &r);
+    }
 
     /* Apply samplers for all 4 texture stages */
     {

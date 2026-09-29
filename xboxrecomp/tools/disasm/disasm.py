@@ -156,10 +156,23 @@ class Disassembler:
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
+            resynced = 0
             for addr in self.seed_functions:
+                # A seed is an assertion that a function starts here, which is
+                # information the linear sweep did not have. Where the sweep
+                # desynchronised, the address falls inside a phantom
+                # instruction and the detector silently drops the candidate --
+                # so re-decode from it first. Without this, seeding an
+                # undetected function reports "could not lift" and says
+                # nothing about why.
+                if self.engine.get_instruction(addr) is None:
+                    n = self.engine.resync_at(addr)
+                    if n:
+                        resynced += 1
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
             if self.verbose:
-                print(f"  Seeded {len(self.seed_functions)} function addresses")
+                print(f"  Seeded {len(self.seed_functions)} function addresses"
+                      + (f" ({resynced} needed a decode resync)" if resynced else ""))
 
         num_funcs = self.func_detector.detect_all(sections)
         if self.verbose:

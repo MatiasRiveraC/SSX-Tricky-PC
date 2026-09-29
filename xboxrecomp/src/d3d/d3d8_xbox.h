@@ -779,9 +779,69 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  * Called from recompiled game code (replaces RW driver Present path).
  */
 void d3d8_PresentFrame(void);
+unsigned d3d8_PresentSeq(void);
+/* NV2A window clip as a scissor rectangle for game draws (part 182). */
+void d3d8_SetWindowClip(int on, long x0, long y0, long x1, long y1);
+int d3d8_WindowClipOn(void);
+
+/* Host display (part 183). d3d8_SetHostDisplay is called before the title
+ * creates its device: render size of the scene target (0 = the title's own
+ * 640x480), 16:9 display shape (only with the title told it is widescreen),
+ * and borderless fullscreen. d3d8_GetGuestScale gives scene pixels per title
+ * pixel, for rectangles the title specifies in its own pixel units. */
+void d3d8_SetHostDisplay(unsigned render_w, unsigned render_h,
+                         int widescreen, int fullscreen);
+void d3d8_GetGuestScale(float *sx, float *sy);
+
+/* The game window's menu and keys (part 183). The window runs on a thread of
+ * its own; these are called on it. create_menu builds the menu bar (NULL for
+ * none), on_command gets its WM_COMMAND ids, on_init_menu refreshes checks
+ * before a menu opens, on_key sees key presses first (return nonzero if
+ * handled), on_menu_loop brackets menu use. Set before the title creates
+ * its device. */
+typedef struct D3D8HostUiHooks {
+    HMENU (*create_menu)(void);
+    void  (*on_command)(HWND hwnd, UINT id);
+    void  (*on_init_menu)(HMENU menu);
+    int   (*on_key)(HWND hwnd, UINT vk);
+    void  (*on_menu_loop)(int entering);   /* a menu opened (1) or closed (0) */
+} D3D8HostUiHooks;
+void d3d8_SetHostUiHooks(const D3D8HostUiHooks *hooks);
+
+/* Controls for the menu. The window ones must be called on its thread. */
+void d3d8_HostSetFullscreen(int on);
+int  d3d8_HostIsFullscreen(void);
+int  d3d8_HostIsWidescreen(void);
+void d3d8_HostSetClientSize(unsigned w, unsigned h);
+void d3d8_HostToast(const wchar_t *text);
+void d3d8_HostExit(void);
+void d3d8_SetMsaa(int samples);          /* 1, 2, 4, 8; applied between frames */
+int  d3d8_GetMsaa(void);
+void d3d8_SetAnisotropy(int n);          /* 0 = the title's own, or 2..16 */
+int  d3d8_GetAnisotropy(void);
+void d3d8_SetShowFps(int on);
+int  d3d8_GetShowFps(void);
+void d3d8_RequestScreenshot(const wchar_t *path);   /* PNG, end of next frame */
+/* NV2A-native draws (d3d8_nv2a.c): pixel shaders generated from the
+ * register combiners, keyed by nv2a_psh_key(). */
+int d3d8_nv2a_has_ps(unsigned long long key);
+int d3d8_nv2a_add_ps(unsigned long long key, const char *hlsl, int len);
+HRESULT d3d8_nv2a_draw(D3DPRIMITIVETYPE prim, UINT prim_count, const void *verts, UINT stride,
+                       unsigned long long ps_key, const void *ps_consts, UINT ps_consts_size,
+                       int raster);
+void d3d8_PumpMessages(void);
+DWORD d3d8_MsSincePresent(void);
+void d3d8_DebugSampleBackbuffer(const char *tag);
+unsigned d3d8_BackbufferHash(void);
+void d3d8_DumpBackbuffer(const char *path);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* BURNOUT3_D3D8_XBOX_H */
+void d3d8_PresentGuestFramebuffer(const void *src, unsigned pitch, unsigned w, unsigned h);
+void d3d8_SetGuestFramebuffer(const void *src, unsigned pitch, unsigned w, unsigned h);
+int d3d8_HasGuestFramebuffer(void);
+int d3d8_GuestFramebufferActive(void);
+void d3d8_SetGuestFramebufferAlt(const void *alt);

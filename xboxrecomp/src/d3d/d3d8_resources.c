@@ -387,6 +387,7 @@ static ULONG __stdcall tex_Release(IDirect3DTexture8 *self)
         if (tex->srv) ID3D11ShaderResourceView_Release(tex->srv);
         if (tex->d3d11_texture) ID3D11Texture2D_Release(tex->d3d11_texture);
         free(tex->sys_mem);
+        free(tex->lvl_mem);
         free(tex);
     }
     return (ULONG)ref;
@@ -428,16 +429,42 @@ static HRESULT __stdcall tex_GetSurfaceLevel(IDirect3DTexture8 *self, UINT Level
     return E_NOTIMPL;
 }
 
+/* Size of one mip level (part 183): dimensions halve down to 1, and a
+ * compressed level is at least one 4x4 block. */
+static void tex_level_dims(const D3D8Texture *tex, UINT level, UINT *w, UINT *h,
+                           UINT *pitch, UINT *rows)
+{
+    UINT lw = tex->width >> level, lh = tex->height >> level;
+    if (lw < 1) lw = 1;
+    if (lh < 1) lh = 1;
+    *w = lw; *h = lh;
+    *pitch = d3d8_row_pitch(tex->d3d8_format, lw);
+    *rows = d3d8_format_is_compressed(tex->d3d8_format) ? (lh + 3) / 4 : lh;
+}
+
 static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT Level, D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags)
 {
     D3D8Texture *tex = tex_from_iface(self);
     (void)pRect; (void)Flags;
 
-    if (!pLockedRect || Level != 0) return E_INVALIDARG;
+    if (!pLockedRect || Level >= tex->levels) return E_INVALIDARG;
     if (tex->locked) return E_FAIL;
 
-    pLockedRect->Pitch = (INT)tex->pitch;
-    pLockedRect->pBits = tex->sys_mem;
+    if (Level == 0) {
+        pLockedRect->Pitch = (INT)tex->pitch;
+        pLockedRect->pBits = tex->sys_mem;
+    } else {
+        /* Smaller levels are written once and uploaded, so one reusable
+         * staging buffer is enough; level 0 keeps its long-lived copy. */
+        UINT w, h, pitch, rows;
+        tex_level_dims(tex, Level, &w, &h, &pitch, &rows);
+        free(tex->lvl_mem);
+        tex->lvl_mem = (BYTE *)calloc(1, (size_t)pitch * rows);
+        if (!tex->lvl_mem) return E_OUTOFMEMORY;
+        pLockedRect->Pitch = (INT)pitch;
+        pLockedRect->pBits = tex->lvl_mem;
+    }
+    tex->lock_level = Level;
     tex->locked = TRUE;
     return S_OK;
 }
@@ -445,44 +472,42 @@ static HRESULT __stdcall tex_LockRect(IDirect3DTexture8 *self, UINT Level, D3DLO
 static HRESULT __stdcall tex_UnlockRect(IDirect3DTexture8 *self, UINT Level)
 {
     D3D8Texture *tex = tex_from_iface(self);
-    if (Level != 0 || !tex->locked) return E_FAIL;
+    if (!tex->locked || Level != tex->lock_level) return E_FAIL;
 
     tex->locked = FALSE;
     tex->dirty = TRUE;
 
-    /* Upload level 0 to GPU */
+    /* Upload the level to the GPU */
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     if (ctx && tex->d3d11_texture) {
-        UINT rows;
-        BYTE *upload_data = tex->sys_mem;
+        UINT w, h, pitch, rows;
+        BYTE *level_mem = Level ? tex->lvl_mem : tex->sys_mem;
+        BYTE *upload_data = level_mem;
         BYTE *unswizzled = NULL;
 
-        if (d3d8_format_is_compressed(tex->d3d8_format))
-            rows = (tex->height + 3) / 4;
-        else
-            rows = tex->height;
+        tex_level_dims(tex, Level, &w, &h, &pitch, &rows);
 
         /* Unswizzle if the format is a swizzled Xbox format */
         if (!d3d8_format_is_compressed(tex->d3d8_format) &&
             d3d8_format_is_swizzled(tex->d3d8_format))
         {
             UINT bpp = d3d8_format_bpp(tex->d3d8_format) / 8;
-            UINT linear_size = tex->width * tex->height * bpp;
+            UINT linear_size = w * h * bpp;
             unswizzled = (BYTE *)malloc(linear_size);
             if (unswizzled) {
-                xbox_unswizzle_rect(unswizzled, tex->sys_mem,
-                                     tex->width, tex->height, bpp);
+                xbox_unswizzle_rect(unswizzled, level_mem, w, h, bpp);
                 upload_data = unswizzled;
             }
         }
 
         ID3D11DeviceContext_UpdateSubresource(ctx,
             (ID3D11Resource *)tex->d3d11_texture,
-            0, NULL, upload_data, tex->pitch, tex->pitch * rows);
+            Level, NULL, upload_data, pitch, pitch * rows);
         tex->dirty = FALSE;
 
         if (unswizzled) free(unswizzled);
     }
+    if (Level) { free(tex->lvl_mem); tex->lvl_mem = NULL; }
     return S_OK;
 }
 

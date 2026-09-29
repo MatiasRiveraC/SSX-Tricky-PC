@@ -109,17 +109,29 @@ static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
 }
 
+/* Every APU write into guest memory passes through here. A write that lands
+ * in the title's image (below XBOX_HEAP_BASE: .text, .rdata, the kernel thunk
+ * table) is never legitimate -- the APU only writes voice state, SGE entries
+ * and notifiers, all of which DirectSound allocates. Report the first few with
+ * the raw address and the host caller, so a bad base register or a folded
+ * alias is named instead of surfacing later as corrupted code. */
+void apu_phys_write_check(hwaddr addr, uint32_t val, int width);
+#define APU_IMAGE_END 0x00214000u
+
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
+    if ((addr & 0x03FFFFFF) < APU_IMAGE_END) apu_phys_write_check(addr, val, 4);
     *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
+    if ((addr & 0x03FFFFFF) < APU_IMAGE_END) apu_phys_write_check(addr, val, 2);
     *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
+    if ((addr & 0x03FFFFFF) < APU_IMAGE_END) apu_phys_write_check(addr, val, 1);
     *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
 }
 

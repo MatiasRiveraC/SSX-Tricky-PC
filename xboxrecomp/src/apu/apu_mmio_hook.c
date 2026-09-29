@@ -77,6 +77,83 @@ static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
  * Instruction decoder for APU MMIO access
  * ============================================================ */
 
+/* Which APU registers the title actually touches.
+ *
+ * DSOUND busy-waits on some hardware condition -- KeStallExecutionProcessor is
+ * 12% of all kernel calls with it enabled, and the main thread never advances.
+ * Counting reads per offset says which register it is polling, which is the
+ * one the stubbed DSP has to answer. XBOX_APU_TRACE=1 prints the histogram
+ * every few seconds. */
+#define APU_HIST_SLOTS 64
+static struct { uint32_t off; unsigned n; uint64_t last; } g_apu_hist[APU_HIST_SLOTS];
+static int g_apu_hist_used = 0;
+
+static void apu_mmio_note(uint32_t off, uint64_t val, int is_write);
+static void apu_mmio_note_read(uint32_t off, uint64_t val)
+{ apu_mmio_note(off, val, 0); }
+static void apu_mmio_note_write(uint32_t off, uint64_t val)
+{ apu_mmio_note(off, val, 1); }
+static void apu_mmio_note(uint32_t off, uint64_t val, int is_write)
+{
+    static int enabled = -1;
+    static unsigned long last_report = 0;
+    int i;
+
+    if (enabled < 0) {
+        const char *e = getenv("XBOX_APU_TRACE");
+        enabled = (e && (e[0] == '1' || e[0] == '2')) ? (e[0] - '0') : 0;
+    }
+    if (!enabled) return;
+
+    /* XBOX_APU_TRACE=2 also logs the first 600 accesses in order. The
+     * histogram says which registers were touched and their last value;
+     * bring-up questions ("was this ever written with X, and before or after
+     * that?") need the sequence. */
+    /* Reads of the PIO free-space register (+0x20010) precede every method
+     * write and would fill the log on their own, so they are left out. */
+    if (enabled == 2 && !(off == 0x20010 && !is_write)) {
+        static volatile LONG seq = 0;
+        LONG k = InterlockedIncrement(&seq);
+        if (k <= 4000) {
+            fprintf(stderr, "  [APU-SEQ] %4ld %s +0x%05X = 0x%llX\n", (long)k,
+                    is_write ? "W" : "R", off, (unsigned long long)val);
+            fflush(stderr);
+        }
+    }
+
+    for (i = 0; i < g_apu_hist_used; i++) {
+        if (g_apu_hist[i].off == (off | (is_write ? 0x80000000u : 0u))) { g_apu_hist[i].n++; g_apu_hist[i].last = val; break; }
+    }
+    int new_reg = 0;
+    if (i == g_apu_hist_used && g_apu_hist_used < APU_HIST_SLOTS) {
+        g_apu_hist[g_apu_hist_used].off  = off | (is_write ? 0x80000000u : 0u);
+        g_apu_hist[g_apu_hist_used].n    = 1;
+        g_apu_hist[g_apu_hist_used].last = val;
+        g_apu_hist_used++;
+        new_reg = 1;
+    }
+
+    /* Report on a 5 s cadence AND whenever a register is seen for the first
+     * time. Cadence alone printed once at the first access and never again
+     * when the rest arrived as one burst inside five seconds -- a whole
+     * DirectSound initialisation read as "one register touched, once"
+     * (part 177). */
+    {
+        unsigned long now = (unsigned long)GetTickCount();
+        if (new_reg || now - last_report >= 5000) {
+            int k;
+            last_report = now;
+            fprintf(stderr, "  [APU-TRACE] accesses by register:\n");
+            for (k = 0; k < g_apu_hist_used; k++)
+                fprintf(stderr, "  [APU-TRACE]   %s +0x%05X  x%-8u last=0x%llX\n",
+                        (g_apu_hist[k].off & 0x80000000u) ? "W" : "R",
+                        g_apu_hist[k].off & 0x7FFFFFFFu, g_apu_hist[k].n,
+                        (unsigned long long)g_apu_hist[k].last);
+            fflush(stderr);
+        }
+    }
+}
+
 static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
@@ -112,6 +189,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         mcpx_apu_mmio_write(g_apu_state, mmio_offset, val, access_size);
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
+        apu_mmio_note_write(mmio_offset, (uint64_t)val);
         return true;
     }
 
@@ -149,6 +227,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         else *dst = val;
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_read_count++;
+        apu_mmio_note_read(mmio_offset, val);
         return true;
     }
 
@@ -252,6 +331,32 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
 /* ============================================================
  * Public API (called from VEH in main.c)
  * ============================================================ */
+
+bool apu_mmio_install(uint8_t *mem_base)
+{
+    DWORD old = 0;
+    void *page = mem_base + APU_MMIO_BASE;
+
+    if (!g_apu_state) {
+        g_apu_state = mcpx_apu_init_standalone(mem_base);
+        if (!g_apu_state) {
+            fprintf(stderr, "  [APU] init failed -- aperture left as plain RAM\n");
+            fflush(stderr);
+            return false;
+        }
+    }
+
+    if (!VirtualProtect(page, APU_MMIO_SIZE, PAGE_NOACCESS, &old)) {
+        fprintf(stderr, "  [APU] could not guard the aperture (error %lu) -- "
+                        "registers stay plain RAM\n", GetLastError());
+        fflush(stderr);
+        return false;
+    }
+    fprintf(stderr, "  [APU] MCPX aperture trapped at Xbox VA 0x%08X (%u bytes)\n",
+            APU_MMIO_BASE, APU_MMIO_SIZE);
+    fflush(stderr);
+    return true;
+}
 
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)

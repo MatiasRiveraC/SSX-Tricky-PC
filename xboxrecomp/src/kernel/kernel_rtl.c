@@ -9,6 +9,7 @@
 
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
@@ -154,38 +155,216 @@ ULONG __stdcall xbox_RtlCompareMemoryUlong(PVOID Source, ULONG Length, ULONG Pat
 }
 
 /* ============================================================================
- * Critical Sections (direct 1:1 mapping)
- * ============================================================================ */
+ * Critical Sections (shadow-mapped onto real native locks)
+ * ============================================================================
+ *
+ * These used to be no-ops. The justification in the old comment was that
+ * "the recompiled game runs single-threaded (all Xbox threads are called
+ * synchronously), so there is no contention" -- that stopped being true:
+ *
+ *   - PsCreateSystemThreadEx creates a *real* OS thread. SSX Tricky spawns its
+ *     file-I/O worker this way, and that worker walks the same file and handle
+ *     lists the main thread walks.
+ *   - The KeTickCount updater (kernel_bridge.c) is a second real thread.
+ *
+ * So the title was running three threads with every one of its own mutual
+ * exclusion primitives disabled. That produces exactly the failure observed:
+ * an intermittent (roughly 1 run in 3), timing-dependent crash inside a list
+ * search (sub_00164600) reached through the file system -- a list read on one
+ * thread while another mutates it. See RE_NOTES_xboxrecomp_test.md, part
+ * thirty-six.
+ *
+ * The fix is the shadow mapping the old TODO called for. The guest's own
+ * 28-byte Xbox RTL_CRITICAL_SECTION cannot be handed to the native API (a
+ * Win32 CRITICAL_SECTION is 40 bytes here and must live outside guest memory),
+ * so each guest CS address is mapped to a native CRITICAL_SECTION held in a
+ * fixed table. Win32 critical sections are recursive and owner-checked, which
+ * matches Xbox RtlEnterCriticalSection semantics exactly.
+ *
+ * Entries are never recycled, so a shadow pointer stays valid for the life of
+ * the process; that removes any use-after-free window if the guest frees a
+ * structure containing a CS. The table is keyed by guest address, so a CS that
+ * gets memcpy'd elsewhere correctly becomes a different lock -- the same thing
+ * real hardware does with the embedded KEVENT.
+ */
+
+#define CS_SHADOW_CAP 4096u   /* power of two; SSX uses far fewer */
+
+typedef struct {
+    void            *key;   /* native pointer to the guest CS; NULL = free */
+    CRITICAL_SECTION lock;
+} cs_shadow;
+
+static cs_shadow        g_cs_shadow[CS_SHADOW_CAP];
+static CRITICAL_SECTION g_cs_table_lock;
+static LONG             g_cs_table_ready = 0;
+static LONG             g_cs_count       = 0;
+
+static void cs_table_init_once(void)
+{
+    /* Init-once as an interlocked state machine: 0 = untouched,
+     * 1 = initialising, 2 = ready. Cheap, and correct if two guest threads
+     * race on first use. */
+    if (InterlockedCompareExchange(&g_cs_table_ready, 1, 0) == 0) {
+        InitializeCriticalSection(&g_cs_table_lock);
+        InterlockedExchange(&g_cs_table_ready, 2);
+        return;
+    }
+    while (InterlockedCompareExchange(&g_cs_table_ready, 2, 2) != 2) {
+        Sleep(0);
+    }
+}
+
+static size_t cs_hash(const void *key)
+{
+    uint64_t h = (uint64_t)(uintptr_t)key;
+    h ^= h >> 33;
+    h *= 0xFF51AFD7ED558CCDull;
+    h ^= h >> 29;
+    return (size_t)(h & (CS_SHADOW_CAP - 1));
+}
 
 /*
- * Critical section operations are no-ops for now.
- *
- * The Xbox CRITICAL_SECTION is a 20-byte 32-bit structure that's
- * incompatible with the Windows 64-bit CRITICAL_SECTION (40 bytes).
- * Passing Xbox memory pointers to native Windows CS functions would
- * corrupt memory. Since the recompiled game runs single-threaded
- * (all Xbox threads are called synchronously), there's no contention
- * and no-ops are correct.
- *
- * TODO: If multithreading is needed, implement a shadow CS mapping
- * (Xbox VA → native Windows CRITICAL_SECTION).
+ * Find (or create) the native lock shadowing this guest critical section.
+ * Returns NULL only if the table is exhausted, in which case the caller
+ * degrades to the old no-op behaviour rather than deadlocking.
  */
+static CRITICAL_SECTION *cs_shadow_for(void *guest_cs)
+{
+    size_t i, slot;
+    CRITICAL_SECTION *result = NULL;
+
+    if (!guest_cs) {
+        return NULL;
+    }
+    cs_table_init_once();
+    slot = cs_hash(guest_cs);
+
+    /* Lookup without the table lock (part 183). Every Enter and Leave came
+     * through here, and taking g_cs_table_lock each time made it the most
+     * contended lock in the process -- a quarter of the game thread's time in
+     * a race went to waiting for it. Entries are never removed and a key is
+     * published only after its lock is initialised, so a reader that finds
+     * its key finds a ready lock; one that reaches an empty slot falls
+     * through to the locked path below, which rechecks before inserting. */
+    for (i = 0; i < CS_SHADOW_CAP; i++) {
+        cs_shadow *e = &g_cs_shadow[(slot + i) & (CS_SHADOW_CAP - 1)];
+        void *k = InterlockedCompareExchangePointer(&e->key, NULL, NULL);
+        if (k == guest_cs) return &e->lock;
+        if (k == NULL) break;
+    }
+
+    EnterCriticalSection(&g_cs_table_lock);
+    for (i = 0; i < CS_SHADOW_CAP; i++) {
+        cs_shadow *e = &g_cs_shadow[(slot + i) & (CS_SHADOW_CAP - 1)];
+        if (e->key == guest_cs) {
+            result = &e->lock;
+            break;
+        }
+        if (e->key == NULL) {
+            /* First use of this guest CS. Titles do not always call
+             * RtlInitializeCriticalSection -- a zero-filled structure is a
+             * valid starting state for some CRT paths -- so create the shadow
+             * lazily on Enter as well as on Initialize. A short spin before
+             * blocking suits the brief holds the title makes. */
+            InitializeCriticalSectionAndSpinCount(&e->lock, 1000);
+            InterlockedExchangePointer(&e->key, guest_cs);   /* publish last */
+            g_cs_count++;
+            result = &e->lock;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs_table_lock);
+
+    if (!result) {
+        static LONG warned = 0;
+        if (InterlockedExchange(&warned, 1) == 0) {
+            fprintf(stderr,
+                    "  [RTL] critical-section shadow table full (%u entries); "
+                    "further sections are unsynchronised\n",
+                    (unsigned)CS_SHADOW_CAP);
+        }
+    }
+    return result;
+}
+
+/*
+ * Mirror the lock state back into the guest's own structure.
+ *
+ * The Xbox RTL_CRITICAL_SECTION is 0x1C bytes:
+ *     0x00  KEVENT Event (0x10 bytes)
+ *     0x10  LONG   LockCount        (-1 when free, per the Rtl convention)
+ *     0x14  LONG   RecursionCount
+ *     0x18  HANDLE OwningThread
+ * Nothing in this implementation reads those fields, but guest code is free
+ * to, and leaving them frozen at whatever the guest last wrote would be a lie
+ * about state we now genuinely track.
+ */
+static void cs_mirror_guest(void *guest_cs, LONG lock_count, LONG recursion,
+                            ULONG owner)
+{
+    volatile LONG *p;
+    if (!guest_cs) {
+        return;
+    }
+    p = (volatile LONG *)((uint8_t *)guest_cs + 0x10);
+    p[0] = lock_count;
+    p[1] = recursion;
+    p[2] = (LONG)owner;
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution, no contention */
+    CRITICAL_SECTION *lock = cs_shadow_for(CriticalSection);
+    if (!lock) {
+        return;
+    }
+
+    /*
+     * Try briefly, then block. The old loop spun on TryEnter with Sleep(0)
+     * for as long as the lock was held, so a contended lock cost a whole core
+     * and delayed its owner; it existed to print a warning after 5 s, which
+     * XBOX_CS_WATCH=1 still does (part 183).
+     */
+    if (!TryEnterCriticalSection(lock)) {
+        static int watch = -1;
+        if (watch < 0) { const char *e = getenv("XBOX_CS_WATCH"); watch = e && e[0] == '1'; }
+        if (watch) {
+            DWORD start = GetTickCount();
+            BOOL moaned = FALSE;
+            while (!TryEnterCriticalSection(lock)) {
+                if (!moaned && GetTickCount() - start > 5000) {
+                    fprintf(stderr,
+                            "  [RTL] thread %lu has waited >5s for critical section "
+                            "%p (possible unbalanced Enter/Leave)\n",
+                            GetCurrentThreadId(), (void *)CriticalSection);
+                    fflush(stderr);
+                    moaned = TRUE;
+                }
+                Sleep(0);
+            }
+        } else {
+            EnterCriticalSection(lock);
+        }
+    }
+
+    cs_mirror_guest(CriticalSection, 0, 1, GetCurrentThreadId());
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    CRITICAL_SECTION *lock = cs_shadow_for(CriticalSection);
+    if (!lock) {
+        return;
+    }
+    cs_mirror_guest(CriticalSection, -1, 0, 0);
+    LeaveCriticalSection(lock);
 }
 
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
-    (void)CriticalSection;
-    /* No-op: single-threaded execution */
+    (void)cs_shadow_for(CriticalSection);   /* creates the shadow lock */
+    cs_mirror_guest(CriticalSection, -1, 0, 0);
 }
 
 /* ============================================================================

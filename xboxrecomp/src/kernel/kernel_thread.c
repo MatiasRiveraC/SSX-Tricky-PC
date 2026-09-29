@@ -176,9 +176,16 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         /* Negative = relative time in 100ns units. Convert to milliseconds. */
         LONGLONG relative_100ns = -Interval->QuadPart;
         ms = (DWORD)(relative_100ns / 10000);
-        /* Ensure at least 1ms for very short intervals */
-        if (ms == 0 && relative_100ns > 0)
-            ms = 1;
+        /* A sub-millisecond wait yields rather than sleeping a whole
+         * millisecond. Rounding up overshoots by up to 10x, and the title uses
+         * these as short spin-waits: the intro video's playback loop issues
+         * roughly 120 of them per frame, so the rounding alone cost ~120 ms a
+         * frame and was most of why playback ran at 1.5 fps. Yielding is the
+         * same thing the zero-interval case above already does. */
+        if (ms == 0 && relative_100ns > 0) {
+            SwitchToThread();
+            return STATUS_SUCCESS;
+        }
     } else {
         /* Positive = absolute time. Calculate relative delay from now. */
         LARGE_INTEGER now;

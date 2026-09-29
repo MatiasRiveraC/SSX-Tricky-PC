@@ -21,4 +21,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 
+/* Buffers queued on the device and not yet played. */
+int xa2_queued(void);
+#define XA2_TARGET_QUEUED 4
+
 #endif /* APU_XAUDIO2_H */

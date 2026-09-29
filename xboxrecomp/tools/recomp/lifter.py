@@ -14,6 +14,7 @@ Memory model:
   - Xbox data sections mapped at original VAs
 """
 
+import os
 import struct
 
 from .disasm import Instruction, Operand
@@ -85,8 +86,17 @@ def _fmt_imm(val):
     return f"0x{val:X}"
 
 
-def _mem_accessor(size):
-    """Return the MEM macro name for a given operand size."""
+def _mem_accessor(size, segment=None):
+    """Return the MEM macro name for a given operand size.
+
+    An `fs:`-segment operand gets the FS* family instead, which resolves
+    against the thread's TIB explicitly. Without this the prefix is dropped and
+    `mov eax, fs:0x28` becomes a plain `MEM32(0x28)` -- indistinguishable from a
+    genuine null dereference at offset 0x28, which is the ambiguity the
+    low-address TIB redirect exists to paper over. See RE_NOTES parts 132-141.
+    """
+    if segment == "fs":
+        return {1: "FS8", 2: "FS16", 4: "FS32"}.get(size, "FS32")
     return {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
 
 
@@ -127,14 +137,14 @@ def _fmt_mem(op):
 
 def _fmt_mem_read(op):
     """Format reading from a memory operand."""
-    accessor = _mem_accessor(op.mem_size)
+    accessor = _mem_accessor(op.mem_size, getattr(op, 'mem_segment', None))
     addr = _fmt_mem(op)
     return f"{accessor}({addr})"
 
 
 def _fmt_mem_write(op, value_expr):
     """Format writing to a memory operand."""
-    accessor = _mem_accessor(op.mem_size)
+    accessor = _mem_accessor(op.mem_size, getattr(op, 'mem_segment', None))
     addr = _fmt_mem(op)
     return f"{accessor}({addr}) = {value_expr};"
 
@@ -147,6 +157,9 @@ def _fmt_operand_read(op):
         return _fmt_imm(op.imm)
     elif op.type == "mem":
         return _fmt_mem_read(op)
+    elif op.type == "snap":
+        # A flag-operand snapshot; `reg` holds its width-preserving C read.
+        return op.reg
     return "/* unknown operand */"
 
 
@@ -188,6 +201,59 @@ COND_MAP = {
     "jecxz": (None,      None,      "ecx is zero"),
     "jcxz":  (None,      None,      "cx is zero"),
 }
+
+# Mnemonics routed to _lift_sse().
+#
+# This is the dispatch gate, and it is the ONLY thing that decides whether an
+# SSE/MMX opcode gets a translation or falls through to the `/* TODO: ... */`
+# fallback at the end of _lift_one(). It used to be an inline tuple at the
+# dispatch site, duplicating part of the list in _EFLAGS_PRESERVE below -- and
+# that list is about *flags*, not dispatch, so adding an opcode there looks
+# like it should work and does nothing. Adding paddusb/pmaddwd/psrld to it and
+# writing the handlers left every site still emitted as a TODO comment.
+#
+# A TODO comment for an MMX opcode is silent data loss, not a missing nicety:
+# the video's YUV-to-RGB converters are written entirely in MMX, so a dropped
+# opcode corrupts the picture rather than slowing it. Keep this set and the
+# handlers in _lift_sse() in step -- an entry here with no handler falls
+# through to the generic SSE comment, which is the same silent loss.
+_SSE_DISPATCH = frozenset({
+    # scalar float
+    "movss", "movsd", "addss", "subss", "mulss", "divss", "sqrtss",
+    "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
+    "minss", "maxss", "minsd", "maxsd", "rsqrtss", "rcpss",
+    "comiss", "comisd", "ucomiss", "ucomisd",
+    "cvtsi2ss", "cvtss2si", "cvttss2si",
+    "cvtsi2sd", "cvtsd2si", "cvttsd2si", "cvtss2sd", "cvtsd2ss",
+    # packed float
+    "movaps", "movups", "movlps", "movhps", "movapd", "movupd", "movdqa", "movdqu",
+    "movlpd", "movhpd", "movlhps", "movhlps", "movntps", "movntdq",
+    "andpd", "orpd", "andnps", "andnpd", "cmpnltps", "cmpnleps",
+    "addps", "subps", "mulps", "divps", "minps", "maxps",
+    "sqrtps", "rsqrtps", "rcpps",
+    "shufps", "unpcklps", "unpckhps",
+    "xorps", "xorpd", "andps", "orps",
+    "cmpneqps", "cmpeqps", "cmpltps", "cmpleps", "movmskps",
+    # MMX moves
+    "movd", "movq", "movntq", "emms",
+    # MMX bitwise
+    "pand", "pandn", "por", "pxor",
+    # MMX packed arithmetic
+    "paddb", "paddw", "paddd", "psubb", "psubw", "psubd",
+    "paddusb", "paddusw", "psubusb", "psubusw",
+    "paddsb", "paddsw", "psubsb", "psubsw",
+    "pmullw", "pmulhw", "pmulhuw", "pmaddwd",
+    "pavgb", "pavgw", "psadbw",
+    "pminub", "pmaxub", "pminsw", "pmaxsw",
+    # MMX shifts
+    "psllw", "pslld", "psllq", "psrlw", "psrld", "psrlq", "psraw", "psrad",
+    # MMX pack / unpack
+    "packuswb", "packsswb", "packssdw",
+    "punpcklbw", "punpckhbw", "punpcklwd", "punpckhwd",
+    "punpckldq", "punpckhdq",
+    # MMX compare
+    "pcmpeqb", "pcmpeqw", "pcmpeqd", "pcmpgtb", "pcmpgtw", "pcmpgtd",
+})
 
 # Instructions that set arithmetic flags (primary set, fully handled)
 FLAG_SETTERS = frozenset({
@@ -252,6 +318,10 @@ _EFLAGS_PRESERVE = frozenset({
     "emms",
     "paddb", "paddw", "paddd", "paddq",
     "psubb", "psubw", "psubd",
+    "paddusb", "paddusw", "psubusb", "psubusw",
+    "paddsb", "paddsw", "psubsb", "psubsw",
+    "pavgb", "pavgw", "psadbw",
+    "pminub", "pmaxub", "pminsw", "pmaxsw",
     "pmullw", "pmulhw", "pmulhuw", "pmaddwd",
     "pand", "pandn", "por", "pxor",
     "pcmpeqb", "pcmpeqw", "pcmpeqd",
@@ -273,15 +343,95 @@ _EFLAGS_PRESERVE = frozenset({
 })
 
 
+_TREE_NAMES = None
+
+
+def _tree_names():
+    """VA -> symbol, from the generated tree's dispatch table.
+
+    Functions in the tree get renamed after generation (Heap_Free for
+    sub_00150950, CRT_ftol_TruncateToInt64 for sub_0015CA68, ...), so a freshly
+    lifted body that calls them by their sub_ name does not link. relift.py and
+    recover_batch.py used to paper over that afterwards, or not at all (part
+    178: a relift left six undefined references). XLIFT_NAME_MAP names the
+    recomp_dispatch.c to read; without it nothing changes."""
+    global _TREE_NAMES
+    if _TREE_NAMES is None:
+        _TREE_NAMES = {}
+        p = os.environ.get("XLIFT_NAME_MAP")
+        if p and os.path.exists(p):
+            import re as _re
+            for l in open(p, encoding="utf-8", errors="replace"):
+                m = _re.search(r"\{ 0x([0-9A-Fa-f]{8})u, \(recomp_func_t\)(\w+) \}", l)
+                if m:
+                    _TREE_NAMES[int(m.group(1), 16)] = m.group(2)
+    return _TREE_NAMES
+
+
+# Pseudo flag setter for a block whose predecessors disagree; its single
+# "operand" is the name prefix of the per-condition locals they assign.
+FIN_SETTER = "__fin"
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
     Returns (cond_expr, description) or None.
+
+    The sign and carry of an 8- or 16-bit operation live in bit 7 / bit 15.
+    The raw forms below cast to (int32_t)/(uint32_t), which on a byte operand
+    never sees that bit: `test al, al; jge` read 0xFF as 255 >= 0, so every AI
+    rider in a race took the human-player branch and the race paused with
+    "controller disconnected" (part 180, Race_SpawnRidersAndLoadAssets
+    0x0002DDC8). Every cast in the condition is narrowed to the operation's
+    width here.
     """
+    r = _make_condition_raw(jcc, flag_setter, flag_ops)
+    if (r is None or flag_setter == FIN_SETTER or not flag_ops
+            or flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip",
+                               "fcomi", "sahf", "comiss", "comisd", "ucomiss", "ucomisd")):
+        return r
+    size = _op_size(flag_ops[0])
+    if size not in (1, 2):
+        return r
+    nt, ut = ("(int8_t)", "(uint8_t)") if size == 1 else ("(int16_t)", "(uint16_t)")
+    cond, desc = r
+    cmp_macro = (COND_MAP.get(jcc) or (None,))[0]
+    if (flag_setter == "cmp" and cmp_macro in ("CMP_L", "CMP_GE", "CMP_LE", "CMP_G",
+                                               "CMP_EQ", "CMP_NE", "CMP_B", "CMP_AE",
+                                               "CMP_BE", "CMP_A")
+            and len(flag_ops) >= 2 and cond.startswith(cmp_macro + "(")):
+        # Both operands at the operation width: an imm8 of 0x80..0xFF is
+        # negative in a byte compare, but RECOMP_SEXT sees a plain int.
+        # Part 182: equality and unsigned compares too -- `cmp word [x], -1`
+        # was emitted as CMP_NE(MEM16(x), 0xFFFFFFFFu), which never matches a
+        # zero-extended 16-bit load; the pose sampler's "is this the root
+        # bone" test (0x107E07 / 0x10803B) always failed and riders' bodies
+        # rendered un-rotated -- mirrored against the board in the race.
+        lhs = _fmt_operand_read(flag_ops[0])
+        rhs = _fmt_operand_read(flag_ops[1])
+        return f"{cmp_macro}({ut}({lhs}), {ut}({rhs}))", desc
+    if flag_setter == "test" and cmp_macro and len(flag_ops) >= 2 and cond.startswith(cmp_macro + "("):
+        # `a & b` is promoted to int, which hides the operand width from
+        # RECOMP_SEXT (sizeof-based); cast it back.
+        lhs = _fmt_operand_read(flag_ops[0])
+        rhs = _fmt_operand_read(flag_ops[1])
+        return f"{cmp_macro}({ut}({lhs} & {rhs}), 0)", desc
+    return cond.replace("(int32_t)", nt).replace("(uint32_t)", ut), desc
+
+
+def _make_condition_raw(jcc, flag_setter, flag_ops):
+    """Width-agnostic conditions; _make_condition narrows them."""
     cond_info = COND_MAP.get(jcc)
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    # Flags materialised by each predecessor (translator._materialise_flags):
+    # the block is reached from setters that disagree, so the condition was
+    # evaluated at the end of every predecessor into a named local.
+    if flag_setter == FIN_SETTER:
+        return f"{flag_ops[0]}_{jcc}", desc
 
     if len(flag_ops) >= 2:
         lhs = _fmt_operand_read(flag_ops[0])
@@ -321,6 +471,8 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if flag_setter in ("comiss", "comisd", "ucomiss", "ucomisd"):
         def _sse_op(op):
             if op.type == "reg":
+                if op.reg.startswith("xmm"):
+                    return op.reg + (".d" if flag_setter.endswith("sd") else ".f")
                 return op.reg
             elif op.type == "mem":
                 if op.mem_size == 8:
@@ -605,8 +757,16 @@ def _emit_cond_goto(cond_expr, jcc, desc, target, lifter):
     if target is None:
         return f"if ({cond_expr}) {{ /* {jcc}: {desc} - indirect */ }}"
     if lifter and lifter._is_external_target(target):
+        # Conditional tail call via the fused cmp/test+jcc path (the most
+        # common shape for this pattern -- see the matching, rarer bug in
+        # _lift_jcc for the standalone-jcc case, both fixed together).
+        # Needs the same `g_seh_ebp = ebp;` bridge as an unconditional tail
+        # jmp (_lift_jmp): missing it here means the target function's own
+        # `ebp = g_seh_ebp;` seed reads whatever unrelated, older frame
+        # g_seh_ebp last held instead of this function's actual frame.
+        # See RE_NOTES_xboxrecomp_test.md, twenty-first follow-up.
         name = lifter._call_target_name(target)
-        return (f"if ({cond_expr}) {{ {name}(); return; }}"
+        return (f"if ({cond_expr}) {{ g_seh_ebp = ebp; {name}(); return; }}"
                 f" /* {jcc}: {desc} */")
     return f"if ({cond_expr}) goto loc_{target:08X}; /* {jcc}: {desc} */"
 
@@ -761,7 +921,10 @@ class Lifter:
         function any naming pass had touched. Labels still cover call targets
         that are not known function starts.
         """
-        if addr in self.func_db:
+        names = _tree_names()
+        if addr in names:
+            name = names[addr]
+        elif addr in self.func_db:
             name = self.func_db[addr].get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
@@ -854,6 +1017,10 @@ class Lifter:
             return self._lift_string_op(insn, m)
         if m == "wait":
             return ["/* wait - FPU sync */"]
+        if m == "in":
+            return self._lift_in(insn, ops)
+        if m == "out":
+            return self._lift_out(insn, ops)
 
         # ── Misc ──
         if m == "cdq":
@@ -892,24 +1059,8 @@ class Lifter:
                  "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns"):
             return self._lift_cmovcc(insn, ops, m)
 
-        # ── SSE (scalar float) ──
-        if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
-                 "addss", "subss", "mulss", "divss", "sqrtss",
-                 "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
-                 "minss", "maxss", "minsd", "maxsd",
-                 "comiss", "comisd", "ucomiss", "ucomisd",
-                 "cvtsi2ss", "cvtss2si", "cvttss2si",
-                 "cvtsi2sd", "cvtsd2si", "cvttsd2si",
-                 "cvtss2sd", "cvtsd2ss",
-                 "xorps", "xorpd", "andps", "orps",
-                 "movd", "movq",
-                 "shufps", "unpcklps", "unpckhps",
-                 "addps", "subps", "mulps", "divps",
-                 "minps", "maxps", "rsqrtss", "rcpss",
-                 "sqrtps", "rsqrtps", "rcpps",
-                 "cmpneqps", "cmpeqps", "cmpltps", "cmpleps",
-                 "movmskps",
-                 "pand", "pandn", "por", "pxor", "pcmpgtd"):
+        # ── SSE / MMX ──
+        if m in _SSE_DISPATCH:
             return self._lift_sse(insn, m, ops)
 
         # ── FPU ──
@@ -1055,6 +1206,45 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         return [_fmt_operand_write(ops[0], f"{dst} + {src} + _cf") + " /* adc */"]
 
+    def _lift_in(self, insn, ops):
+        """IN AL/AX/EAX, DX  or  IN AL/AX/EAX, imm8 -- x86 port I/O read.
+
+        Found unhandled (silently left as a `/* TODO: in ... */` comment,
+        with the destination register never touched) while tracing SSX
+        Tricky's D3D device-init chain into real hardware bring-up code --
+        see RE_NOTES_xboxrecomp_test.md, twenty-second follow-up. Unlike
+        MEM32/MEM8 (plain memory, correctly emulated by mapping real pages),
+        x86 port I/O has no address-space representation at all in this
+        runtime, so it needs its own primitive: XBOX_IO_READ8/16/32(port),
+        dispatched at runtime (xbox_io_port_read in kernel_bridge.c) to
+        whatever that specific port actually means on real Xbox hardware --
+        confirmed against xemu's port-0x80C0 (ACPI GPIO block) handling for
+        the one call site this was found through, defaulting to 0 for any
+        port without a specific implementation (the same "nothing here"
+        default real unpopulated I/O space reads as).
+        """
+        if len(ops) < 2:
+            return [f"/* in: bad operands */"]
+        dst_reg = ops[0].reg if ops[0].type == "reg" else None
+        port_expr = _fmt_operand_read(ops[1])
+        if dst_reg == "al":
+            return [f"SET_LO8(eax, XBOX_IO_READ8({port_expr})); /* in al, ... */"]
+        if dst_reg == "ax":
+            return [f"SET_LO16(eax, XBOX_IO_READ16({port_expr})); /* in ax, ... */"]
+        return [f"eax = XBOX_IO_READ32({port_expr}); /* in eax, ... */"]
+
+    def _lift_out(self, insn, ops):
+        """OUT DX/imm8, AL/AX/EAX -- x86 port I/O write. See _lift_in."""
+        if len(ops) < 2:
+            return [f"/* out: bad operands */"]
+        port_expr = _fmt_operand_read(ops[0])
+        src_reg = ops[1].reg if ops[1].type == "reg" else None
+        if src_reg == "al":
+            return [f"XBOX_IO_WRITE8({port_expr}, LO8(eax)); /* out ..., al */"]
+        if src_reg == "ax":
+            return [f"XBOX_IO_WRITE16({port_expr}, LO16(eax)); /* out ..., ax */"]
+        return [f"XBOX_IO_WRITE32({port_expr}, eax); /* out ..., eax */"]
+
     def _lift_shld(self, insn, ops):
         """SHLD: double-precision shift left."""
         if len(ops) < 3:
@@ -1131,14 +1321,21 @@ class Lifter:
             return ["/* sar: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})")]
+        # An arithmetic shift copies the operand's own sign bit: bit 7 of a
+        # byte, bit 15 of a word. (int32_t) of a byte read is never negative,
+        # so `sar cl, 1` shifted in zeros (part 180).
+        st = {1: "int8_t", 2: "int16_t"}.get(_op_size(ops[0]) or 4, "int32_t")
+        return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t)({st}){dst} >> {cnt})")
+                if st != "int32_t" else
+                _fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})")]
 
     def _lift_rotate(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        func = "ROL32" if m == "rol" else "ROR32"
+        width = {1: "8", 2: "16"}.get(_op_size(ops[0]) or 4, "32")
+        func = ("ROL" if m == "rol" else "ROR") + width
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
     # ── Compare / Test (standalone) ──
@@ -1188,7 +1385,15 @@ class Lifter:
         # The callee's 'ret' will pop it back off.
         if insn.call_target:
             name = self._call_target_name(insn.call_target)
-            lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
+            if name == "CRT_ftol_TruncateToInt64":
+                # The helper converts ST(0), which lives in the caller's
+                # simulated x87 stack; it reads it through g_ftol_arg
+                # (recomp_types.h). Every call in the tree carries this, added
+                # by a post-pass the lifter never learned.
+                lines = [f"PUSH32(esp, 0); g_ftol_arg = fp_top(); {name}(); "
+                         f"/* call 0x{insn.call_target:08X} */"]
+            else:
+                lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
             if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
@@ -1289,8 +1494,19 @@ class Lifter:
             cond = "ecx == 0" if jcc == "jecxz" else "LO16(ecx) == 0"
             if target:
                 if self._is_external_target(target):
+                    # Conditional tail call. Same "bridge ebp so the target
+                    # can inherit our frame pointer" requirement as the
+                    # unconditional case in _lift_jmp -- missing here was a
+                    # real bug (found on SSX Tricky): sub_0017FE15's own
+                    # `push ebp; mov ebp, esp` prologue frame never reached
+                    # sub_0017FE66 through this exact conditional-tail-call
+                    # path, so sub_0017FE66's `ebp = g_seh_ebp;` (itself a
+                    # separate, now-fixed bug -- see the has_prologue seeding
+                    # fix in translator.py) read whatever g_seh_ebp was last
+                    # set to by a completely unrelated, much older frame.
+                    # See RE_NOTES_xboxrecomp_test.md, twenty-first follow-up.
                     name = self._call_target_name(target)
-                    return [f"if ({cond}) {{ {name}(); return; }} /* {jcc} */"]
+                    return [f"if ({cond}) {{ g_seh_ebp = ebp; {name}(); return; }} /* {jcc} */"]
                 return [f"if ({cond}) goto loc_{target:08X}; /* {jcc} */"]
             return [f"/* {jcc} - no target */"]
 
@@ -1298,8 +1514,9 @@ class Lifter:
         desc = cond_info[2] if cond_info else jcc
         if target:
             if self._is_external_target(target):
+                # Same missing-ebp-bridge bug as the jecxz/jcxz case above.
                 name = self._call_target_name(target)
-                return [f"if (_flags /* {jcc}: {desc} */) {{ {name}(); return; }}"]
+                return [f"if (_flags /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
             return [f"if (_flags /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
@@ -1378,32 +1595,208 @@ class Lifter:
         if nops < 1:
             return [f"/* {m}: no operands */"]
 
-        # SSE register names (xmm0-xmm7) are used as float locals
-        def _sse_read(op):
+        # XMM registers are recomp_xmm_t (recomp_types.h): .f low float lane,
+        # .d low double, .l[4]/.u[4] packed lanes, .x all 16 bytes. They used
+        # to be declared `float`, which moved 4 of 16 bytes on every movaps and
+        # had no packed arithmetic at all; part 47 fixed the generated tree by
+        # a one-off transform, but the lifter kept emitting the old model, so
+        # every function recovered afterwards was broken again (part 178).
+        dbl = m.endswith("sd") or m.endswith("pd") or m in ("comisd", "ucomisd")
+        lane = "d" if dbl else "f"
+
+        def _is_x(op):
+            return op.type == "reg" and op.reg.startswith("xmm")
+
+        def _sse_read(op, ln=None):
+            ln = ln or lane
             if op.type == "reg":
-                return op.reg  # xmm0, xmm1, etc.
+                return f"{op.reg}.{ln}" if op.reg.startswith("xmm") else op.reg
             elif op.type == "mem":
-                if op.mem_size == 8:
+                if ln == "d" or op.mem_size == 8:
                     return f"MEMD({_fmt_mem(op)})"
                 return f"MEMF({_fmt_mem(op)})"
             elif op.type == "imm":
                 return _fmt_imm(op.imm)
             return f"/* sse_read? */"
 
-        def _sse_write(op, val):
+        def _sse_write(op, val, ln=None):
+            ln = ln or lane
             if op.type == "reg":
-                return f"{op.reg} = {val};"
+                return (f"{op.reg}.{ln} = {val};" if op.reg.startswith("xmm")
+                        else f"{op.reg} = {val};")
             elif op.type == "mem":
-                if op.mem_size == 8:
+                if ln == "d" or op.mem_size == 8:
                     return f"MEMD({_fmt_mem(op)}) = {val};"
                 return f"MEMF({_fmt_mem(op)}) = {val};"
             return f"/* sse_write? */;"
 
+        def _x128(op):
+            """A whole 128-bit operand as recomp_xmm_t."""
+            if _is_x(op):
+                return op.reg
+            if op.type == "mem":
+                return f"XMMM({_fmt_mem(op)})"
+            return "/* x128? */"
+
+        # ── MMX moves ──
+        #
+        # `movq` between an MMX register and memory was falling through to the
+        # generic "/* SSE: ... */" comment, i.e. it did nothing. The MMX
+        # register file (mm0-mm7 as uint64_t) and the arithmetic helpers were
+        # already there, so the loads and the *store* were the only missing
+        # piece -- and dropping the store is what makes an MMX loop read
+        # nothing, compute nothing and write nothing while the scalar code
+        # around it advances its pointers as though it had.
+        #
+        # 100 sites in this tree, 45 of them in the five functions that do the
+        # video's YUV-to-RGB conversion. See RE_NOTES part 145.
+        def _is_mm(op):
+            return op.type == "reg" and op.reg.startswith("mm")                 and not op.reg.startswith("mmx")
+
+        if m in ("movq", "movntq") and nops >= 2:
+            dst, src = ops[0], ops[1]
+            if _is_mm(dst) and src.type == "mem":
+                return [f"{dst.reg} = MEM64({_fmt_mem(src)}); /* {m} */"]
+            if dst.type == "mem" and _is_mm(src):
+                return [f"MEM64({_fmt_mem(dst)}) = {src.reg}; /* {m} */"]
+            if _is_mm(dst) and _is_mm(src):
+                return [f"{dst.reg} = {src.reg}; /* {m} */"]
+            # movq between xmm registers, or xmm<->mem: the 64-bit low half.
+            if dst.type == "reg" and src.type == "mem"                     and dst.reg.startswith("xmm"):
+                return [f"memcpy(&{dst.reg}, XBOX_PTR({_fmt_mem(src)}), 8);"
+                        f" /* {m} */"]
+            if dst.type == "mem" and src.type == "reg"                     and src.reg.startswith("xmm"):
+                return [f"memcpy(XBOX_PTR({_fmt_mem(dst)}), &{src.reg}, 8);"
+                        f" /* {m} */"]
+
+        # MMX bitwise ops.  The mm registers are plain uint64_t in the generated
+        # code, so these are ordinary integer operations and there was never a
+        # reason to drop them.  All 8 remaining sites (4 pand, 4 por) sit in the
+        # video's YUV-to-RGB converters -- sub_00149450/500/5E0/670 -- where the
+        # mask and the merge are what assemble each output pixel, so dropping
+        # them silently produces garbage for every frame.  See RE_NOTES part 157.
+        # MMX packed integer arithmetic and packing. These were emitted as bare
+        # `TODO` comments, which is silent data loss rather than a missing
+        # nicety: in the video's YUV-to-RGB row converter (sub_001493E0) the two
+        # dropped `paddw`s meant chroma was never added to luma and the dropped
+        # `packuswb` meant 16-bit table entries were stored unpacked, producing
+        # a luminance-only picture with the chroma bytes left at zero.
+        # See RE_NOTES part 163.
+        _MMX_BIN = {
+            "paddb": "mmx_paddb", "paddw": "mmx_paddw", "paddd": "mmx_paddd",
+            "psubb": "mmx_psubb", "psubw": "mmx_psubw", "psubd": "mmx_psubd",
+            "packuswb": "mmx_packuswb", "packsswb": "mmx_packsswb",
+            "packssdw": "mmx_packssdw",
+            # Saturating adds. paddusb is what applies the per-channel bias to
+            # an already-packed pixel in the YUV converters, and the saturation
+            # is the point -- without it a bright channel wraps to black.
+            "paddusb": "mmx_paddusb", "paddusw": "mmx_paddusw",
+            "psubusb": "mmx_psubusb", "psubusw": "mmx_psubusw",
+            "paddsb": "mmx_paddsb", "psubsb": "mmx_psubsb",
+            "paddsw": "mmx_paddsw", "psubsw": "mmx_psubsw",
+            # Packed multiply. pmaddwd folds an RGB888 triple onto the bit
+            # positions of RGB565 in one instruction.
+            "pmaddwd": "mmx_pmaddwd", "pmullw": "mmx_pmullw",
+            "pmulhw": "mmx_pmulhw", "pmulhuw": "mmx_pmulhuw",
+            # Unpack / interleave / average, used by motion compensation.
+            "punpcklbw": "mmx_punpcklbw", "punpckhbw": "mmx_punpckhbw",
+            "punpcklwd": "mmx_punpcklwd", "punpckhwd": "mmx_punpckhwd",
+            "punpckldq": "mmx_punpckldq", "punpckhdq": "mmx_punpckhdq",
+            "pavgb": "mmx_pavgb", "pavgw": "mmx_pavgw",
+            # Compare / min / max / SAD.
+            "pcmpeqb": "mmx_pcmpeqb", "pcmpeqw": "mmx_pcmpeqw",
+            "pcmpeqd": "mmx_pcmpeqd", "pcmpgtb": "mmx_pcmpgtb",
+            "pcmpgtw": "mmx_pcmpgtw", "pcmpgtd": "mmx_pcmpgtd",
+            "pminub": "mmx_pminub", "pmaxub": "mmx_pmaxub",
+            "pminsw": "mmx_pminsw", "pmaxsw": "mmx_pmaxsw",
+            "psadbw": "mmx_psadbw",
+        }
+        if m in _MMX_BIN and nops >= 2:
+            dst, src = ops[0], ops[1]
+            if _is_mm(dst):
+                if _is_mm(src):
+                    rhs = src.reg
+                elif src.type == "mem":
+                    rhs = f"MEM64({_fmt_mem(src)})"
+                else:
+                    rhs = None
+                if rhs is not None:
+                    fn = _MMX_BIN[m]
+                    return [f"{dst.reg} = {fn}({dst.reg}, {rhs}); /* {m} */"]
+
+        # Packed shifts. Unlike the arithmetic above these take an immediate
+        # count as often as a register one, which is why they were missed by
+        # the reg/mem-only test and left as TODO comments. In the YUV-to-RGB
+        # converters the `psrld mm1, 0xb` is what moves the red channel down to
+        # its RGB565 bit position and the `psrlq mm0, 0x10` is what brings the
+        # second pixel into the low half before the store -- dropping either
+        # leaves the packed pixel scrambled rather than merely dimmed.
+        _MMX_SHIFT = {
+            "psrlw": "mmx_psrlw", "psrld": "mmx_psrld", "psrlq": "mmx_psrlq",
+            "psllw": "mmx_psllw", "pslld": "mmx_pslld", "psllq": "mmx_psllq",
+            "psraw": "mmx_psraw", "psrad": "mmx_psrad",
+        }
+        if m in _MMX_SHIFT and nops >= 2:
+            dst, src = ops[0], ops[1]
+            if _is_mm(dst):
+                if src.type == "imm":
+                    rhs = f"{src.imm & 0xFF}u"
+                elif _is_mm(src):
+                    rhs = src.reg
+                elif src.type == "mem":
+                    rhs = f"MEM64({_fmt_mem(src)})"
+                else:
+                    rhs = None
+                if rhs is not None:
+                    fn = _MMX_SHIFT[m]
+                    return [f"{dst.reg} = {fn}({dst.reg}, {rhs}); /* {m} */"]
+
+        if m in ("pand", "pandn", "por", "pxor") and nops >= 2:
+            dst, src = ops[0], ops[1]
+            if _is_mm(dst):
+                if _is_mm(src):
+                    rhs = src.reg
+                elif src.type == "mem":
+                    rhs = f"MEM64({_fmt_mem(src)})"
+                else:
+                    rhs = None
+                if rhs is not None:
+                    if m == "pand":
+                        return [f"{dst.reg} &= {rhs}; /* {m} */"]
+                    if m == "por":
+                        return [f"{dst.reg} |= {rhs}; /* {m} */"]
+                    if m == "pxor":
+                        return [f"{dst.reg} ^= {rhs}; /* {m} */"]
+                    # pandn dst, src  ==  dst = (~dst) & src
+                    return [f"{dst.reg} = (~{dst.reg}) & {rhs}; /* {m} */"]
+
         # ── Moves ──
+        if m in ("movaps", "movups", "movapd", "movupd", "movdqa", "movdqu",
+                 "movntps", "movntdq") and nops >= 2:
+            d, sr = ops[0], ops[1]
+            if _is_x(d) and _is_x(sr):
+                return [f"{d.reg} = {sr.reg}; /* {m} */"]
+            if _is_x(d) and sr.type == "mem":
+                return [f"{d.reg}.x = MEMX({_fmt_mem(sr)}); /* {m} */"]
+            if d.type == "mem" and _is_x(sr):
+                return [f"MEMX({_fmt_mem(d)}) = {sr.reg}.x; /* {m} */"]
+        if m in ("movss", "movsd") and nops >= 2:
+            d, sr = ops[0], ops[1]
+            if _is_x(d) and sr.type == "mem":
+                # a load clears the lanes above the scalar, a register move does not
+                hi = "u[1] = {r}.u[2] = {r}.u[3]" if lane == "f" else "u[2] = {r}.u[3]"
+                return [f"{d.reg}." + hi.format(r=d.reg) + f" = 0; {_sse_write(d, _sse_read(sr))} /* {m} */"]
+            return [_sse_write(d, _sse_read(sr)) + f" /* {m} */"]
+        if m in ("movlps", "movlpd", "movhps", "movhpd") and nops >= 2:
+            d, sr = ops[0], ops[1]
+            half = "0" if m in ("movlps", "movlpd") else "2"
+            if _is_x(d) and sr.type == "mem":
+                return [f"memcpy(&{d.reg}.u[{half}], XBOX_PTR({_fmt_mem(sr)}), 8); /* {m} */"]
+            if d.type == "mem" and _is_x(sr):
+                return [f"memcpy(XBOX_PTR({_fmt_mem(d)}), &{sr.reg}.u[{half}], 8); /* {m} */"]
+        if m in ("movlhps", "movhlps") and nops >= 2 and _is_x(ops[0]) and _is_x(ops[1]):
+            return [f"XMM_{m.upper()}({ops[0].reg}, {ops[1].reg}); /* {m} */"]
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps"):
-            if nops >= 2:
-                src = _sse_read(ops[1])
-                return [_sse_write(ops[0], src) + f" /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m == "movd":
@@ -1444,8 +1837,7 @@ class Lifter:
         if m in ("addps", "subps", "mulps", "divps"):
             if nops >= 2:
                 c_op = {"addps": "+", "subps": "-", "mulps": "*", "divps": "/"}[m]
-                d, s = _sse_read(ops[0]), _sse_read(ops[1])
-                return [f"/* {m}: {d} {c_op}= {s} (packed 4xfloat) */"]
+                return [f"XMM_BINOP({ops[0].reg}, {_x128(ops[1])}, {c_op}=); /* {m} */"]
 
         # ── Conversions ──
         if m == "cvtsi2ss":
@@ -1454,7 +1846,7 @@ class Lifter:
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1], 'f')}") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
@@ -1464,10 +1856,10 @@ class Lifter:
                 return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
-                return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
+                return [_sse_write(ops[0], f"(double){_sse_read(ops[1], 'f')}", "d") + " /* cvtss2sd */"]
         if m == "cvtsd2ss":
             if nops >= 2:
-                return [_sse_write(ops[0], f"(float){_sse_read(ops[1])}") + " /* cvtsd2ss */"]
+                return [_sse_write(ops[0], f"(float){_sse_read(ops[1], 'd')}", "f") + " /* cvtsd2ss */"]
 
         # ── Comparison ──
         if m in ("comiss", "comisd", "ucomiss", "ucomisd"):
@@ -1475,19 +1867,20 @@ class Lifter:
                 return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} - sets EFLAGS */"]
 
         # ── Bitwise ──
-        if m in ("xorps", "xorpd"):
-            if nops >= 2 and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-                return [_sse_write(ops[0], "0.0f") + f" /* {m} self = zero */"]
-            if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} */"]
-        if m in ("andps", "orps"):
-            if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} */"]
+        if m in ("xorps", "xorpd", "andps", "andpd", "orps", "orpd", "andnps", "andnpd") and nops >= 2:
+            d = ops[0].reg
+            if m in ("xorps", "xorpd") and _is_x(ops[1]) and ops[1].reg == d:
+                return [f"memset(&{d}, 0, sizeof({d})); /* {m} self = zero */"]
+            if m in ("andnps", "andnpd"):
+                return [f"XMM_ANDNPS({d}, {_x128(ops[1])}); /* {m} */"]
+            bop = {"x": "^", "a": "&", "o": "|"}[m[0]]
+            return [f"{{ recomp_xmm_t _s_ = {_x128(ops[1])}; int _i_; "
+                    f"for (_i_ = 0; _i_ < 4; _i_++) {d}.u[_i_] {bop}= _s_.u[_i_]; }} /* {m} */"]
 
         # ── Packed min/max ──
         if m in ("minps", "maxps"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} (packed 4xfloat) */"]
+                return [f"XMM_{m.upper()}({ops[0].reg}, {_x128(ops[1])}); /* {m} */"]
 
         # ── Reciprocal / rsqrt ──
         if m == "rsqrtss":
@@ -1506,28 +1899,25 @@ class Lifter:
         # the destination stale and fed garbage into vector normalisation.
         # rsqrtps/sqrtps are the workhorse of 3D vector normalize; Wreckless
         # uses them heavily, Burnout 3 did not, which is why this surfaced now.
-        if m == "sqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"sqrtf({_sse_read(ops[1])})")
-                        + " /* sqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rsqrtps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / sqrtf({_sse_read(ops[1])})")
-                        + " /* rsqrtps (low lane; 4-lane model TODO) */"]
-        if m == "rcpps":
-            if nops >= 2:
-                return [_sse_write(ops[0], f"1.0f / {_sse_read(ops[1])}")
-                        + " /* rcpps (low lane; 4-lane model TODO) */"]
+        if m in ("sqrtps", "rsqrtps", "rcpps") and nops >= 2:
+            f = {"sqrtps": "sqrtf(_s_.l[_i_])", "rsqrtps": "1.0f / sqrtf(_s_.l[_i_])",
+                 "rcpps": "1.0f / _s_.l[_i_]"}[m]
+            return [f"{{ recomp_xmm_t _s_ = {_x128(ops[1])}; int _i_; "
+                    f"for (_i_ = 0; _i_ < 4; _i_++) {ops[0].reg}.l[_i_] = {f}; }} /* {m} */"]
 
         # ── Packed comparison ──
-        if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps"):
+        if m in ("cmpneqps", "cmpeqps", "cmpltps", "cmpleps", "cmpnltps", "cmpnleps"):
             if nops >= 2:
-                return [f"/* {m} {_sse_read(ops[0])}, {_sse_read(ops[1])} (packed compare) */"]
+                c = {"cmpneqps": "!=", "cmpeqps": "==", "cmpltps": "<", "cmpleps": "<=",
+                     "cmpnltps": ">=", "cmpnleps": ">"}[m]
+                return [f"XMM_CMPPS({ops[0].reg}, {_x128(ops[1])}, {c}); /* {m} */"]
 
         # ── Move mask ──
         if m == "movmskps":
-            if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"0 /* movmskps {_sse_read(ops[1])} */")]
+            if nops >= 2 and _is_x(ops[1]):
+                r = ops[1].reg
+                return [_fmt_operand_write(ops[0], f"(({r}.u[0] >> 31) | (({r}.u[1] >> 31) << 1)"
+                        f" | (({r}.u[2] >> 31) << 2) | (({r}.u[3] >> 31) << 3))") + " /* movmskps */"]
 
         # ── MMX / integer SIMD ──
         if m in ("pand", "pandn", "por", "pxor", "pcmpgtd"):
@@ -1535,6 +1925,10 @@ class Lifter:
                 return [f"/* {m} {insn.op_str} (MMX/SIMD integer) */"]
 
         # ── Shuffle/unpack ──
+        if m == "shufps" and nops >= 3 and ops[2].type == "imm":
+            return [f"XMM_SHUFPS({ops[0].reg}, {_x128(ops[1])}, 0x{ops[2].imm & 0xFF:x}); /* shufps */"]
+        if m in ("unpcklps", "unpckhps") and nops >= 2:
+            return [f"XMM_{m.upper()}({ops[0].reg}, {_x128(ops[1])}); /* {m} */"]
         if m in ("shufps", "unpcklps", "unpckhps"):
             return [f"/* {m} {insn.op_str} */"]
 
@@ -1543,91 +1937,456 @@ class Lifter:
     # ── FPU (x87) ──
 
     def _lift_fpu(self, insn, m, ops):
-        """Basic FPU instruction translation using double locals."""
-        # FPU is complex. We translate common patterns to double operations.
-        # Full accuracy would require an x87 stack emulator.
+        """x87 -> C over the simulated register file (fp_push/fp_pop/fp_top/
+        fp_st1 and _fp_stack[(_fp_top + i) & 7] for st(i)).
 
-        if m == "fld":
-            if len(ops) >= 1:
-                if ops[0].type == "mem":
-                    if ops[0].mem_size == 4:
-                        return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
-                    elif ops[0].mem_size == 8:
-                        return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
-                    return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
-            return [f"/* fld {insn.op_str} */"]
+        Rewritten in part 179. The old version collapsed every fadd/fsub/fmul/
+        fdiv to the popping two-register form, popped on `fst`, did not pop on
+        `fistp`/`fcomp`/`fcompp`, compared a memory `fcom` against st(1), and
+        left fld/fstp st(i), fsubr/fdivr, the integer forms, fsin/fcos and
+        fnstsw as comments. The generated tree was corrected afterwards by a
+        series of post-passes (fixfpmem, fixfpudrop, fixfpbranch, ...) that
+        nothing recovered later ever received. Semantics are Intel's.
+        """
+        def st(i):
+            if i == 0:
+                return "fp_top()"
+            if i == 1:
+                return "fp_st1()"
+            return f"_fp_stack[(_fp_top + {i}) & 7]"
 
-        if m in ("fst", "fstp"):
-            pop = "p" if m == "fstp" else ""
-            if len(ops) >= 1 and ops[0].type == "mem":
+        def st_index(op):
+            if op.type == "reg" and op.reg and op.reg.startswith("st"):
+                r = op.reg.replace("(", "").replace(")", "")
+                return int(r[2:]) if len(r) > 2 else 0
+            return None
+
+        def mem_float(op):
+            if op.mem_size == 8:
+                return f"MEMD({_fmt_mem(op)})"
+            if op.mem_size == 4:
+                return f"(double)MEMF({_fmt_mem(op)})"
+            return None
+
+        def mem_int(op):
+            if op.mem_size == 2:
+                return f"(double)SMEM16({_fmt_mem(op)})"
+            if op.mem_size == 4:
+                return f"(double)SMEM32({_fmt_mem(op)})"
+            if op.mem_size == 8:
+                return f"(double)(int64_t)MEM64({_fmt_mem(op)})"
+            return None
+
+        c = f"/* {m} {insn.op_str} */".replace("  */", " */")
+        nops = len(ops)
+
+        # ── loads ──
+        if m == "fld" and nops >= 1:
+            if ops[0].type == "mem":
                 if ops[0].mem_size == 4:
-                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top(); fp_pop{pop}(); /* {m} */"]
-                elif ops[0].mem_size == 8:
-                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top(); fp_pop{pop}(); /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+                    return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
+                if ops[0].mem_size == 8:
+                    return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
+                if ops[0].mem_size == 10:
+                    return [f"fp_push(x87_load80(XBOX_PTR({_fmt_mem(ops[0])}))); {c}"]
+            i = st_index(ops[0])
+            if i is not None:
+                return [f"{{ double _v = {st(i)}; fp_push(_v); }} {c}"]
+        if m == "fild" and nops >= 1 and ops[0].type == "mem":
+            if ops[0].mem_size in (2, 4):
+                return [f"fp_push((double){_smem_accessor(ops[0].mem_size)}({_fmt_mem(ops[0])})); /* fild */"]
+            v = mem_int(ops[0])
+            if v:
+                return [f"fp_push({v}); {c}"]
+        consts = {"fldz": "0.0", "fld1": "1.0", "fldpi": "3.14159265358979323846",
+                  "fldl2e": "1.44269504088896340736", "fldl2t": "3.32192809488736234787",
+                  "fldlg2": "0.301029995663981195214", "fldln2": "0.693147180559945309417"}
+        if m in consts:
+            return [f"fp_push({consts[m]}); {c}"]
 
-        if m == "fild":
-            if len(ops) >= 1 and ops[0].type == "mem":
-                smem = _smem_accessor(ops[0].mem_size)
-                return [f"fp_push((double){smem}({_fmt_mem(ops[0])})); /* fild */"]
-            return [f"/* fild {insn.op_str} */"]
+        # ── stores ──
+        if m in ("fst", "fstp") and nops >= 1:
+            if ops[0].type == "mem" and ops[0].mem_size == 10:
+                pop = " fp_pop();" if m == "fstp" else ""
+                return [f"x87_store80(XBOX_PTR({_fmt_mem(ops[0])}), fp_top());{pop} {c}"]
+            if ops[0].type == "mem" and ops[0].mem_size in (4, 8):
+                acc = "MEMF" if ops[0].mem_size == 4 else "MEMD"
+                cast = "(float)" if ops[0].mem_size == 4 else ""
+                if m == "fstp":
+                    return [f"{acc}({_fmt_mem(ops[0])}) = {cast}fp_top(); fp_popp(); /* fstp */"]
+                return [f"{acc}({_fmt_mem(ops[0])}) = {cast}fp_top(); "
+                        f"/* fst: stores st(0), does NOT pop */"]
+            i = st_index(ops[0])
+            if i is not None:
+                if m == "fst":
+                    return [f"{st(i)} = fp_top(); {c}"]
+                if i == 0:
+                    return [f"fp_pop(); {c}"]
+                return [f"{{ double _v = fp_top(); fp_pop(); _fp_stack[(_fp_top + {i - 1}) & 7] = _v; }} {c}"]
+        if m in ("fist", "fistp", "fisttp") and nops >= 1 and ops[0].type == "mem":
+            pop = " fp_pop();" if m != "fist" else ""
+            conv = "trunc(fp_top())" if m == "fisttp" else "x87_rint(fp_top())"
+            sz = ops[0].mem_size
+            if sz == 8:
+                return [f"MEM64({_fmt_mem(ops[0])}) = (uint64_t)(int64_t){conv};{pop} {c}"]
+            if sz == 4:
+                return [f"MEM32({_fmt_mem(ops[0])}) = (uint32_t)(int32_t){conv};{pop} {c}"]
+            if sz == 2:
+                return [f"MEM16({_fmt_mem(ops[0])}) = (uint16_t)(int16_t){conv};{pop} {c}"]
 
-        if m in ("fist", "fistp"):
-            if len(ops) >= 1 and ops[0].type == "mem":
-                mem_acc = _mem_accessor(ops[0].mem_size)
-                return [f"{mem_acc}({_fmt_mem(ops[0])}) = (int32_t)fp_top(); /* {m} */"]
-            return [f"/* {m} {insn.op_str} */"]
+        # ── arithmetic (port of tools/audit/fixfpmem.py build()) ──
+        base = m
+        popping = base.endswith("p") and base in ("faddp", "fsubp", "fsubrp", "fmulp", "fdivp", "fdivrp")
+        if popping:
+            base = base[:-1]
+        reverse = base in ("fsubr", "fdivr", "fisubr", "fidivr")
+        core = base[:-1] if reverse else base
+        sym = {"fadd": "+", "fsub": "-", "fmul": "*", "fdiv": "/",
+               "fiadd": "+", "fisub": "-", "fimul": "*", "fidiv": "/"}.get(core)
+        if sym is not None:
+            if nops == 1 and ops[0].type == "mem":
+                v = mem_int(ops[0]) if core.startswith("fi") else mem_float(ops[0])
+                if v:
+                    e = f"{v} {sym} fp_top()" if reverse else f"fp_top() {sym} {v}"
+                    return [f"fp_top() = {e}; {c}"]
+            regs = [st_index(o) for o in ops]
+            if nops == 0:
+                regs = [1]                      # faddp == faddp st(1), st(0)
+            if all(r is not None for r in regs):
+                if len(regs) == 2 and regs[1] == 0 and regs[0] != 0:
+                    dst, src = regs[0], 0       # st(i), st(0)
+                elif len(regs) == 2:
+                    dst, src = 0, regs[1]       # st(0), st(i)
+                elif popping:
+                    dst, src = regs[0], 0       # fop p st(i)  ==  st(i), st(0)
+                else:
+                    dst, src = 0, regs[0]       # fop st(i)    ==  st(0), st(i)
+                if popping and dst == 1 and src == 0 and not reverse:
+                    return [f"fp_st1() {sym}= fp_top(); fp_pop(); /* {m} */"]
+                e = f"{st(src)} {sym} {st(dst)}" if reverse else f"{st(dst)} {sym} {st(src)}"
+                return [f"{st(dst)} = {e};{' fp_pop();' if popping else ''} {c}"]
 
-        if m == "fadd":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* fadd */"]
-        if m == "faddp":
-            return [f"fp_st1() += fp_top(); fp_pop(); /* faddp */"]
-        if m == "fsub":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsub */"]
-        if m == "fsubp":
-            return [f"fp_st1() -= fp_top(); fp_pop(); /* fsubp */"]
-        if m == "fmul":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmul */"]
-        if m == "fmulp":
-            return [f"fp_st1() *= fp_top(); fp_pop(); /* fmulp */"]
-        if m == "fdiv":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdiv */"]
-        if m == "fdivp":
-            return [f"fp_st1() /= fp_top(); fp_pop(); /* fdivp */"]
-        if m == "fchs":
-            return [f"fp_top() = -fp_top(); /* fchs */"]
-        if m == "fabs":
-            return [f"fp_top() = fabs(fp_top()); /* fabs */"]
-        if m == "fsqrt":
-            return [f"fp_top() = sqrt(fp_top()); /* fsqrt */"]
+        # ── one-operand and constant-free ops ──
+        unary = {"fchs": "-fp_top()", "fabs": "fabs(fp_top())", "fsqrt": "sqrt(fp_top())",
+                 "fsin": "sin(fp_top())", "fcos": "cos(fp_top())",
+                 "frndint": "x87_rint(fp_top())", "f2xm1": "(pow(2.0, fp_top()) - 1.0)"}
+        if m in unary:
+            return [f"fp_top() = {unary[m]}; {c}"]
+        if m == "fsincos":
+            return [f"{{ double _s = sin(fp_top()), _c = cos(fp_top()); fp_top() = _s; fp_push(_c); }} {c}"]
+        if m == "fptan":
+            return [f"fp_top() = tan(fp_top()); fp_push(1.0); {c}"]
+        if m == "fpatan":
+            return [f"fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); {c}"]
+        if m == "fscale":
+            return [f"fp_top() = fp_top() * pow(2.0, trunc(fp_st1())); {c}"]
+        if m == "fprem":
+            return [f"fp_top() = fmod(fp_top(), fp_st1()); {c}"]
+        if m == "fprem1":
+            return [f"fp_top() = remainder(fp_top(), fp_st1()); {c}"]
+        if m == "fyl2x":
+            return [f"fp_st1() = fp_st1() * log2(fp_top()); fp_pop(); {c}"]
+        if m == "fyl2xp1":
+            return [f"fp_st1() = fp_st1() * log2(fp_top() + 1.0); fp_pop(); {c}"]
         if m == "fxch":
-            return [f"{{ double _t = fp_top(); fp_top() = fp_st1(); fp_st1() = _t; }} /* fxch */"]
-        if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp"):
-            # Set _fpu_cmp for the fcomp/fnstsw/sahf pattern
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
-                    f" /* {m} {insn.op_str} */"]
+            i = next((st_index(o) for o in ops if st_index(o)), 1)
+            cx = "/* fxch */" if i == 1 else c
+            return [f"{{ double _t = fp_top(); fp_top() = {st(i)}; {st(i)} = _t; }} {cx}"]
+
+        # ── compares ──
+        if m in ("fcom", "fcomp", "fcompp", "fucom", "fucomp", "fucompp", "ficom", "ficomp", "ftst"):
+            if m == "ftst":
+                rhs = "0.0"
+            elif nops >= 1 and ops[0].type == "mem":
+                rhs = mem_int(ops[0]) if m.startswith("fi") else mem_float(ops[0])
+            else:
+                i = next((st_index(o) for o in ops if st_index(o)), 1)
+                rhs = st(i)
+            pops = 2 if m.endswith("pp") else (1 if m.endswith("p") else 0)
+            if rhs == "fp_st1()" and pops == 0 and m in ("fcom", "fucom"):
+                return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
+                        f" /* {m} {insn.op_str} */"]
+            if rhs:
+                return [f"{{ double _fc = {rhs}; _fpu_cmp = (fp_top() < _fc) ? -1 : (fp_top() > _fc) ? 1 : 0; "
+                        f"g_fpu_cmp = _fpu_cmp;{' fp_pop();' * pops} }} {c}"]
         if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi"):
-            # These set EFLAGS directly (CF, ZF, PF) from FPU comparison
-            # fcompi/fucompi pop st(0) after comparing; fcomi/fucomi do not
+            # These set EFLAGS directly (CF, ZF, PF); the *ip forms pop.
+            i = next((st_index(o) for o in ops if st_index(o)), 1)
             pops = m.endswith("pi") or m.endswith("ip")
-            pop_code = " fp_pop();" if pops else ""
-            return [f"_fpu_cmp = (fp_top() < fp_st1()) ? -1 : (fp_top() > fp_st1()) ? 1 : 0;"
-                    f"{pop_code} /* {m} */"]
-        if m == "fnstsw":
-            return [f"/* fnstsw {insn.op_str} - store FPU status word */"]
-        if m == "fnstcw":
-            return [f"/* fnstcw {insn.op_str} - store FPU control word */"]
-        if m == "fldcw":
-            return [f"/* fldcw {insn.op_str} - load FPU control word */"]
-        if m == "fldz":
-            return [f"fp_push(0.0); /* fldz */"]
-        if m == "fld1":
-            return [f"fp_push(1.0); /* fld1 */"]
+            return [f"_fpu_cmp = (fp_top() < {st(i)}) ? -1 : (fp_top() > {st(i)}) ? 1 : 0;"
+                    f"{' fp_pop();' if pops else ''} {c}"]
+        if m in ("fnstsw", "fstsw"):
+            if nops >= 1 and ops[0].type == "reg" and ops[0].reg == "ax":
+                return [f"g_fpu_cmp = _fpu_cmp; FNSTSW_AX(eax); {c}"]
+            if nops >= 1 and ops[0].type == "mem":
+                return [f"MEM16({_fmt_mem(ops[0])}) = (uint16_t)(FPU_AH() << 8); {c}"]
+        if m in ("fnstcw", "fstcw") and nops >= 1 and ops[0].type == "mem":
+            return [f"MEM16({_fmt_mem(ops[0])}) = g_x87_cw; {c}"]
+        if m == "fldcw" and nops >= 1 and ops[0].type == "mem":
+            return [f"g_x87_cw = MEM16({_fmt_mem(ops[0])}); {c}"]
+        if m == "fxam":
+            # Classify st(0) into C3/C2/C1/C0 for the next fnstsw (x87_fxam).
+            return [f"_fpu_cmp = g_fpu_cmp = x87_fxam(fp_top()); {c}"]
+        if m in ("fnstcw", "fstcw", "fldcw", "fnclex", "fclex", "fninit", "finit",
+                 "fwait", "wait", "fnop", "ffree", "fdecstp", "fincstp"):
+            return [f"(void)0; {c}"]
 
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+# ── Deferred-flag operand snapshots ──────────────────────────
+#
+# Flags are not materialised. A flag-setting instruction emits nothing (cmp,
+# test) or only its data effect (sub, and, dec, ...), and the consumer -- a
+# jcc, setcc, cmovcc, sbb or adc -- rebuilds the condition from the setter's
+# OPERANDS, formatted where the consumer is. That is only right if nothing in
+# between rewrites those operands, and compiled code does exactly that all the
+# time, because mov/pop/lea leave the flags alone:
+#
+#     cmp  [ebp-8], edi         ; edi == 0 here
+#     pop  edi                  ; edi restored to the caller's value
+#     pop  esi
+#     je   skip                 ; hardware tests the cmp above
+#
+# was emitted as `if (CMP_EQ(MEM32(ebp + -8), edi))` after the pops -- a
+# compare against the wrong edi. In DirectSound's lock release that sent
+# KfLowerIrql a byte the lock never wrote (48, then 192), and the video path
+# bugchecked IRQL_NOT_LESS_OR_EQUAL on it. See RE_NOTES part 177; the same
+# class broke async file loads in part 30-something and was patched by a
+# one-off script over the generated C, which every relift since has undone.
+#
+# So: when something between a setter and a consumer in the same block writes
+# a register or memory the setter's operands read, snapshot those operands
+# into _fsa/_fsb at the setter -- before it for cmp/test (which do not change
+# them), after it for result-based setters (whose conditions are built from the
+# post-op destination) -- and give the consumers the snapshots. Snapshots keep
+# the operand's width, because the CMP_* macros take signedness from sizeof().
+
+_GP_FAMILY = {}
+for _fam, _names in (("eax", ("al", "ah", "ax", "eax")),
+                     ("ebx", ("bl", "bh", "bx", "ebx")),
+                     ("ecx", ("cl", "ch", "cx", "ecx")),
+                     ("edx", ("dl", "dh", "dx", "edx")),
+                     ("esi", ("si", "esi")), ("edi", ("di", "edi")),
+                     ("ebp", ("bp", "ebp")), ("esp", ("sp", "esp"))):
+    for _n in _names:
+        _GP_FAMILY[_n] = _fam
+_GP_SIZE = {"al": 1, "ah": 1, "bl": 1, "bh": 1, "cl": 1, "ch": 1, "dl": 1,
+            "dh": 1, "ax": 2, "bx": 2, "cx": 2, "dx": 2, "si": 2, "di": 2,
+            "bp": 2, "sp": 2}
+
+_SNAP_PRE = frozenset({"cmp", "test"})
+_SNAP_POST = frozenset({"sub", "add", "and", "or", "xor", "inc", "dec", "neg",
+                        "adc", "sbb"})
+_SETCC = frozenset({"sete", "setne", "setb", "setae", "setbe", "seta", "setl",
+                    "setge", "setle", "setg", "sets", "setns", "setz", "setnz",
+                    "setc", "setnc", "setnae", "setnb", "setna", "setnbe",
+                    "setnge", "setnl", "setng", "setnle"})
+_CF_CONSUMERS = frozenset({"sbb", "adc", "rcl", "rcr"})
+# Instructions whose first operand is read, not written.
+_NO_DST_WRITE = frozenset({
+    "cmp", "test", "bt", "nop", "push", "jmp", "prefetchnta", "prefetcht0",
+    "prefetcht1", "prefetcht2", "comiss", "comisd", "ucomiss", "ucomisd",
+    "fld", "fild", "fbld", "fcom", "fcomp", "fucom", "fucomp", "ficom",
+    "ficomp", "fldcw", "fldenv", "frstor"})
+_STRING_OPS = frozenset({"movsb", "movsw", "movsd", "stosb", "stosw", "stosd",
+                         "lodsb", "lodsw", "lodsd", "scasb", "scasw", "scasd",
+                         "cmpsb", "cmpsw", "cmpsd"})
+
+
+def _op_size(op):
+    if op.type == "reg":
+        return _GP_SIZE.get(op.reg, 4)
+    if op.type == "mem":
+        return op.mem_size or 4
+    if op.type == "snap":
+        return op.snap_size
+    return None
+
+
+def _op_reads(op):
+    """(GP register families, reads memory?) that evaluating `op` depends on."""
+    regs = set()
+    if op.type == "reg":
+        f = _GP_FAMILY.get(op.reg)
+        if f:
+            regs.add(f)
+        return regs, False
+    if op.type == "mem":
+        for r in (op.mem_base, op.mem_index):
+            f = _GP_FAMILY.get(r) if r else None
+            if f:
+                regs.add(f)
+        return regs, True
+    return regs, False
+
+
+def _insn_writes(ins):
+    """Over-approximate (GP register families written, writes memory?).
+
+    Over-approximating only costs an unneeded snapshot; missing a write is
+    the bug this exists to prevent."""
+    m = ins.mnemonic
+    ops = ins.operands
+    regs = set()
+    mem = False
+
+    def fam(op):
+        return _GP_FAMILY.get(op.reg) if op.type == "reg" else None
+
+    if m.startswith("rep") or m in _STRING_OPS:
+        return {"esi", "edi", "ecx", "eax"}, True
+    if m in ("push", "pushfd", "pushf", "pushad", "pushal"):
+        return {"esp"}, True
+    if m in ("pop", "popfd", "popf"):
+        regs.add("esp")
+        if ops and fam(ops[0]):
+            regs.add(fam(ops[0]))
+        if ops and ops[0].type == "mem":
+            mem = True
+        return regs, mem
+    if m in ("popad", "popal"):
+        return set(_GP_FAMILY.values()), False
+    if m == "call":
+        return {"eax", "ecx", "edx", "esp"}, True
+    if m == "leave":
+        return {"esp", "ebp"}, False
+    if m == "enter":
+        return {"esp", "ebp"}, True
+    if m in ("cdq", "cwd"):
+        return {"edx"}, False
+    if m in ("cwde", "cbw", "lahf"):
+        return {"eax"}, False
+    if m in ("mul", "div", "idiv", "rdtsc") or (m == "imul" and len(ops) == 1):
+        return {"eax", "edx"}, False
+    if m == "cpuid":
+        return {"eax", "ebx", "ecx", "edx"}, False
+    if m in ("fnstsw", "fstsw") and (not ops or ops[0].type == "reg"):
+        return {"eax"}, False
+    if m in ("xchg", "xadd", "cmpxchg", "cmpxchg8b"):
+        for op in ops:
+            if fam(op):
+                regs.add(fam(op))
+            elif op.type == "mem":
+                mem = True
+        if m in ("cmpxchg", "cmpxchg8b"):
+            regs |= {"eax", "edx"}
+        return regs, mem
+    if ops and m not in _NO_DST_WRITE and not m.startswith("j"):
+        if fam(ops[0]):
+            regs.add(fam(ops[0]))
+        elif ops[0].type == "mem":
+            mem = True
+    return regs, mem
+
+
+def _is_flag_consumer(ins):
+    m = ins.mnemonic
+    if ins.is_cond_jump:
+        return m not in ("jecxz", "jcxz")
+    return m in _SETCC or m.startswith("cmov") or m in _CF_CONSUMERS
+
+
+def _sets_flags(ins):
+    m = ins.mnemonic
+    if m in FLAG_SETTERS or m in _EFLAGS_SETTERS or m in _FLAGS_UNDEFINED:
+        return True
+    if m in ("fcompi", "fcomip", "fucomi", "fucompi", "fucomip", "fcomi",
+             "sahf", "popfd", "popf"):
+        return True
+    return m.startswith("rep") and ("cmps" in m or "scas" in m)
+
+
+def _needs_flag_snapshot(insns, i, ops=None, live_out=True):
+    """True if, between the flag setter insns[i] and a flag consumer, something
+    writes what the setter's operands read.
+
+    The consumer may be in a later block: a block that ends with the flags
+    still live hands them to its successors, which rebuild the condition from
+    the same operands. So reaching the end of the block with the operands
+    overwritten needs a snapshot too.
+
+    With `ops`, checks operands that arrived from a predecessor, from insns[i]
+    onward (i itself included)."""
+    reads_regs, reads_mem = set(), False
+    for op in (ops if ops is not None else insns[i].operands)[:2]:
+        r, mm = _op_reads(op)
+        reads_regs |= r
+        reads_mem = reads_mem or mm
+    if not reads_regs and not reads_mem:
+        return False
+    clobbered = False
+    for k in range(i if ops is not None else i + 1, len(insns)):
+        ins = insns[k]
+        if _is_flag_consumer(ins) and clobbered:
+            return True
+        if _sets_flags(ins):
+            return False
+        w_regs, w_mem = _insn_writes(ins)
+        if (w_regs & reads_regs) or (w_mem and reads_mem):
+            clobbered = True
+    return clobbered and ops is None and live_out
+
+
+def _emit_flag_snapshot(ops):
+    """Copy the setter's operands into _fsa/_fsb. Returns (stmts, new_ops)."""
+    stmts, new_ops, seen = [], [], {}
+    names = ["_fsa", "_fsb"]
+    n = 0
+    for op in ops[:2]:
+        if op.type not in ("reg", "mem"):
+            new_ops.append(op)
+            continue
+        expr = _fmt_operand_read(op)
+        if expr in seen:
+            new_ops.append(seen[expr])
+            continue
+        name = names[n]
+        n += 1
+        size = _op_size(op) or 4
+        stmts.append(f"{name} = (uint32_t)({expr}); /* flag operand snapshot */")
+        cast = {1: "uint8_t", 2: "uint16_t"}.get(size)
+        snap = Operand(type="snap", reg=f"(({cast}){name})" if cast else name)
+        snap.snap_size = size
+        seen[expr] = snap
+        new_ops.append(snap)
+    new_ops.extend(ops[2:])
+    return stmts, new_ops
+
+
+def _make_cf_expr(setter, ops):
+    """CF as a C expression, from the last flag setter, for sbb/adc/rcl/rcr.
+
+    `_cf` used to be a local initialised to 0 and never assigned, so every
+    `sbb reg, reg` produced 0 -- including MSVC's boolean idiom
+    `cmp al, 2 / sbb eax, eax / neg eax` (= al < 2), which is how DirectSound's
+    lock decides whether it raised IRQL. It never did. Operands here are the
+    ones _make_condition would use: post-op for result-based setters."""
+    if setter == FIN_SETTER:
+        return f"{ops[0]}_jb"
+    if setter in ("test", "and", "or", "xor"):
+        return "0"
+    if not ops:
+        return None
+    size = _op_size(ops[0]) or 4
+    mask = {1: "0xFFu", 2: "0xFFFFu"}.get(size, "0xFFFFFFFFu")
+    a = _fmt_operand_read(ops[0])
+    b = _fmt_operand_read(ops[1]) if len(ops) >= 2 else None
+    if setter == "cmp" and b is not None:
+        return f"((((uint32_t)({a})) & {mask}) < (((uint32_t)({b})) & {mask}))"
+    if setter == "sub" and b is not None:
+        # a is post-op: a_pre = a + b, and a_pre < b iff the subtraction borrowed.
+        return (f"(((((uint32_t)({a})) + ((uint32_t)({b}))) & {mask}) "
+                f"< (((uint32_t)({b})) & {mask}))")
+    if setter == "add" and b is not None and a != b:
+        # post-op sum below an addend iff the addition carried.
+        return f"((((uint32_t)({a})) & {mask}) < (((uint32_t)({b})) & {mask}))"
+    if setter == "neg":
+        return f"((((uint32_t)({a})) & {mask}) != 0u)"
+    return None
+
+
+def lift_basic_block(lifter, bb, flag_state=None, live_out=True):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -1652,6 +2411,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
     else:
         last_flag_setter = None
         last_flag_ops = []
+
+    # Flags that arrived from a predecessor are rebuilt from the setter's
+    # operands; if this block overwrites them before consuming, copy them
+    # first, exactly as for a setter inside the block.
+    if (last_flag_setter and last_flag_setter != FIN_SETTER
+            and last_flag_setter in (_SNAP_PRE | _SNAP_POST)
+            and all(isinstance(o, Operand) for o in last_flag_ops)
+            and _needs_flag_snapshot(insns, 0, ops=last_flag_ops)):
+        snap_stmts, last_flag_ops = _emit_flag_snapshot(last_flag_ops)
+        stmts.extend(snap_stmts)
 
     while i < len(insns):
         curr = insns[i]
@@ -1718,14 +2487,37 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        # Snapshot the setter's operands if something before its consumer
+        # overwrites them -- see _needs_flag_snapshot.
+        snap_ops = None
+        snap_post = False
+        if curr.mnemonic in _SNAP_PRE or curr.mnemonic in _SNAP_POST:
+            if _needs_flag_snapshot(insns, i, live_out=live_out):
+                if curr.mnemonic in _SNAP_PRE:
+                    snap_stmts, snap_ops = _emit_flag_snapshot(curr.operands)
+                    stmts.extend(snap_stmts)
+                else:
+                    snap_post = True
+
+        # sbb/adc/rcl/rcr read CF, which is never materialised: compute it
+        # from the previous setter before this instruction consumes it.
+        if curr.mnemonic in ("sbb", "adc") and last_flag_setter:
+            cf = _make_cf_expr(last_flag_setter, last_flag_ops)
+            if cf is not None:
+                stmts.append(f"_cf = {cf}; /* CF from {last_flag_setter} */")
+
         # Lift the instruction normally
         results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
 
+        if snap_post:
+            snap_stmts, snap_ops = _emit_flag_snapshot(curr.operands)
+            stmts.extend(snap_stmts)
+
         # Track flag-setting instructions
         if curr.mnemonic in FLAG_SETTERS:
             last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
+            last_flag_ops = snap_ops if snap_ops is not None else list(curr.operands)
         elif curr.mnemonic in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None

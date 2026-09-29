@@ -36,14 +36,22 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes */
-#define KernelMode  0
-#define UserMode    1
+/* Processor modes.
+ * NOT a #define: MinGW's SDK headers don't provide this WDK-level enum
+ * themselves, but they do have an unrelated struct field also named
+ * KernelMode deep in the RPC headers (rpcasync.h, pulled in transitively
+ * through windows.h). A textual #define here blindly substitutes into that
+ * struct's field name too and breaks the build; an enum constant lives in a
+ * separate namespace from struct members in C, so it can't collide with it. */
+enum { KernelMode = 0, UserMode = 1 };
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0
 #define APC_LEVEL       1
 #define DISPATCH_LEVEL  2
+#ifndef HIGH_LEVEL
+#define HIGH_LEVEL      31  /* highest IRQL that exists */
+#endif
 
 /*
  * NTSTATUS codes - guard each against Windows SDK redefinition.
@@ -87,6 +95,9 @@ typedef LONG KPRIORITY;
 #endif
 #ifndef STATUS_END_OF_FILE
 #define STATUS_END_OF_FILE              ((NTSTATUS)0xC0000011L)
+/* Returned for any attempt to modify the game disc, which is read-only on
+ * real hardware and when served from a mounted ISO (see xbox_xdvdfs.c). */
+#define STATUS_MEDIA_WRITE_PROTECTED     ((NTSTATUS)0xC00000A2L)
 #endif
 #ifndef STATUS_NO_MEMORY
 #define STATUS_NO_MEMORY                ((NTSTATUS)0xC0000017L)
@@ -347,6 +358,8 @@ struct _XBOX_KTIMER {
     PXBOX_KDPC  Dpc;               /* Optional DPC to queue on expiry */
     BOOLEAN     Inserted;
     LONG        Period;
+    LONGLONG    armed_qpc;          /* when last armed (XBOX_TIMER_LOG) */
+    DWORD       due_ms;             /* delay last requested */
 };
 
 /* Deferred Procedure Call */
@@ -483,6 +496,10 @@ void xbox_kernel_bridge_init(void);
 
 /* Initialize path translation with base directories */
 void xbox_path_init(const char* game_dir, const char* save_dir);
+
+/* Point T:/U: at the title's own TDATA/UDATA directories, matching where
+ * its Device\Harddisk0\Partition1 paths resolve. */
+void xbox_path_set_title_id(unsigned int title_id);
 
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
@@ -692,7 +709,13 @@ LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
+/* Signal an Xbox-VA-identified dispatcher object (kernel_bridge.c) -- for
+ * runtime subsystems (e.g. the PFIFO/GPU pump thread) that need to fire a
+ * kernel event periodically with no real hardware interrupt behind it. */
+void xbox_signal_dispatcher_event(uint32_t obj_va);
+
 BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
+VOID               xbox_KeReleaseTimerResources(PXBOX_KTIMER Timer);
 BOOLEAN  __stdcall xbox_KeSetTimer(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, PXBOX_KDPC Dpc);
 BOOLEAN  __stdcall xbox_KeSetTimerEx(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PXBOX_KDPC Dpc);
 VOID     __stdcall xbox_KeInitializeTimerEx(PXBOX_KTIMER Timer, XBOX_TIMER_TYPE Type);
@@ -913,19 +936,25 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define SMC_CMD_LED_STATES      0x08    /* LED states */
 #define SMC_CMD_SCRATCH         0x1B    /* Scratch register */
 
-/* ---- EEPROM non-volatile setting indices ---- */
-#define XC_TIMEZONE_BIAS           0x01
-#define XC_TZ_STD_NAME            0x02
-#define XC_TZ_STD_DATE           0x03
-#define XC_TZ_STD_BIAS           0x04
-#define XC_TZ_DLT_NAME           0x05
-#define XC_TZ_DLT_DATE           0x06
-#define XC_TZ_DLT_BIAS           0x07
-#define XC_LANGUAGE               0x08
-#define XC_VIDEO                  0x09
-#define XC_AUDIO                  0x0A
-#define XC_PARENTAL_CONTROL       0x0B
-#define XC_PARENTAL_PASSWORD      0x0C
+/* ---- EEPROM non-volatile setting indices ----
+ * Part 183: these were one too high. The title's own XAPI settles it:
+ * XGetVideoFlags (0x15299F) queries index 8, XGetAudioFlags (0x1529CA) 9, and
+ * the parental-control query (0x152A0E) 10 -- so language is 7 and the
+ * time-zone block starts at 0. (The live path for this title is
+ * bridge_ExQueryNonVolatileSetting, which is index-exact; the table-driven
+ * xbox_ExQueryNonVolatileSetting below had been answering the wrong items.) */
+#define XC_TIMEZONE_BIAS           0x00
+#define XC_TZ_STD_NAME            0x01
+#define XC_TZ_STD_DATE           0x02
+#define XC_TZ_STD_BIAS           0x03
+#define XC_TZ_DLT_NAME           0x04
+#define XC_TZ_DLT_DATE           0x05
+#define XC_TZ_DLT_BIAS           0x06
+#define XC_LANGUAGE               0x07
+#define XC_VIDEO                  0x08
+#define XC_AUDIO                  0x09
+#define XC_PARENTAL_CONTROL       0x0A
+#define XC_PARENTAL_PASSWORD      0x0B
 #define XC_ONLINE_IP_ADDRESS      0x0D
 #define XC_ONLINE_DNS_ADDRESS     0x0E
 #define XC_ONLINE_DEFAULT_GATEWAY 0x0F
@@ -934,11 +963,16 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_DVD_REGION             0x12
 #define XC_MAX_OS                 0xFF
 
-/* Video standard flags in XC_VIDEO */
-#define XC_VIDEO_FLAGS_WIDESCREEN   0x01
-#define XC_VIDEO_FLAGS_HDTV         0x02
-#define XC_VIDEO_FLAGS_PAL_I        0x04
-#define XC_VIDEO_FLAGS_LETTERBOX    0x10
+/* Video flags as stored in XC_VIDEO. XGetVideoFlags returns them shifted
+ * down by 16 (widescreen = 1, 720p = 2, 1080i = 4, 480p = 8, letterbox =
+ * 0x10, PAL 60 Hz = 0x40); the stored value carries them in the high half. */
+#define XC_VIDEO_FLAGS_WIDESCREEN   0x00010000
+#define XC_VIDEO_FLAGS_HDTV         0x00020000   /* 720p */
+#define XC_VIDEO_FLAGS_PAL_I        0x00400000   /* PAL 60 Hz */
+#define XC_VIDEO_FLAGS_LETTERBOX    0x00100000
+
+/* Host-set answer for XC_VIDEO (part 183); see kernel_bridge.c. */
+void xbox_SetVideoFlags(uint32_t eeprom_video_flags);
 
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);
