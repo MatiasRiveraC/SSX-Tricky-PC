@@ -22,7 +22,7 @@ It also adds:
 > **This port was made with [Claude Code](https://claude.com/claude-code)**, Anthropic's AI coding assistant. Claude Code wrote most of the port's code, tools and notes, working with the project's human author, who directed, tested and played it. See [Contributors](#contributors).
 
 > [!WARNING]
-> **Work in progress.** The game boots, plays its intro movies with sound, runs the whole frontend and races Garibaldi against the AI at 60 fps. Other courses, modes and the finish of a race have not been checked yet. See [Status](#status).
+> **Work in progress.** The game boots, plays its intro movies with sound, runs the whole frontend, and races against the AI at 60 fps through the finish and the results screen. Hard-disk saves work. See [Status](#status).
 
 ---
 
@@ -135,14 +135,15 @@ There is no language option: the game always uses its American text, and the USA
 
 ## Status
 
-**Works:** boot and save detection, the EA and attract movies with sound, the whole frontend (title, mode, character, event, difficulty and venue select), loading, and a full race on **Garibaldi** with the AI riders, HUD, race clock and speed effects, at 60 fps.
+**Works:** boot, the EA and attract movies with sound, the whole frontend (title, mode, character, outfit, board, event, difficulty and venue select), loading, and full races with the AI riders, HUD, race clock and speed effects at 60 fps, through the finish camera and the results screen. Saving and loading on the hard disk. Rider voices, the announcer and the countdown.
 
 **Known differences from the Xbox** (being worked on):
 
-- **Distant fog is too weak.** Far-away terrain is barely fogged, where the console fades it into the sky colour. Without the fog, ground right at the edge of the view distance can look speckled. This is what makes some surfaces look wrong at a distance and right up close.
-- Some particle effects (snow spray, trails) are smaller or dimmer than on the console.
-- In the frontend, some lit floors are darker than on the console, and the board is not shown beside the rider on the setup screen.
-- Other courses, the other modes, and the end of a race are untested.
+- The pre-race intro (course fly-over and rider cutscene) is often skipped.
+- Character dialogue starts slightly late.
+- The Uberboard renders black on the board screen, and the name boards behind the riders in character select are lit a little differently.
+- Some particle effects (snow spray, trails) are smaller or dimmer than on the console, and the course mist sits wrong.
+- Courses other than Garibaldi and Mesablanca, and the other modes, are lightly tested.
 
 The full engineering log is in [`docs/notes/`](docs/notes/): start with `RE_NOTES_INDEX.md` and `RE_NOTES_DECOMP_PROGRESS.md`.
 

@@ -690,6 +690,24 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileDispositionInformation: {
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
+            /* FATX removes the name at once; Win32's classic delete-on-close
+             * leaves a delete-pending entry until the last handle closes, and
+             * recreating the name meanwhile fails with ACCESS_DENIED. Saving
+             * over a save does exactly that -- XDeleteSaveGame, then
+             * CreateDirectory of the same folder -- so every overwrite said
+             * "Save Failed" (part 183). POSIX-semantics delete (Windows 10
+             * 1709+, NTFS) unlinks immediately; fall back where it is not
+             * supported. */
+            if (info->DeleteFile) {
+                struct { DWORD Flags; } fdx;
+                fdx.Flags = 0x1 /* DELETE */ | 0x2 /* POSIX_SEMANTICS */
+                          | 0x10 /* IGNORE_READONLY_ATTRIBUTE */;
+                if (SetFileInformationByHandle(FileHandle, (FILE_INFO_BY_HANDLE_CLASS)21
+                                               /* FileDispositionInfoEx */, &fdx, sizeof fdx)) {
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    return STATUS_SUCCESS;
+                }
+            }
             fdi.DeleteFile = info->DeleteFile;
             if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,

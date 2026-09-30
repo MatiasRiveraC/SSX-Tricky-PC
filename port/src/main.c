@@ -58,6 +58,16 @@ void xbox_SetVideoFlags(uint32_t eeprom_video_flags);
 void d3d8_SetMsaa(int samples);
 void d3d8_SetAnisotropy(int n);
 void d3d8_SetShowFps(int on);
+void d3d8_RequestScreenshot(const wchar_t *path);
+extern void (*g_diag_shot_hook)(const wchar_t *path);   /* xbox_diag.c `shot` */
+extern int (*g_diag_press_hook)(const char *name, int ms); /* xbox_diag.c `press` */
+int xinput_hle_press(const char *name, int ms);            /* xapi_input_hle.c */
+extern void (*g_diag_drawlog_hook)(int frames);            /* xbox_diag.c `drawlog` */
+void nv2a_drawlog_arm(int frames);                         /* nv2a_pgraph_d3d11.c */
+extern void (*g_diag_skipprog_hook)(uint32_t hash);        /* xbox_diag.c `skipprog` */
+void nv2a_skipprog_set(uint32_t h);                        /* nv2a_pgraph_d3d11.c */
+extern void (*g_diag_ignored_hook)(void);                  /* xbox_diag.c `ignored` */
+void nv2a_ignored_dump(void);                              /* nv2a_pgraph_d3d11.c */
 
 /* Where this run's log goes (empty: no log), and whether a crash should be
  * explained in a message box -- only for the player, never in a test run,
@@ -865,6 +875,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         }
     }
 
+    g_diag_shot_hook = d3d8_RequestScreenshot;
+    g_diag_press_hook = xinput_hle_press;
+    g_diag_drawlog_hook = nv2a_drawlog_arm;
+    g_diag_skipprog_hook = nv2a_skipprog_set;
+    g_diag_ignored_hook = nv2a_ignored_dump;
     xbox_diag_start();
     {   /* XBOX_PROFILE=START,SECONDS: see xboxrecomp/src/kernel/xbox_profile.c */
         extern void xbox_profile_start_from_env(void);

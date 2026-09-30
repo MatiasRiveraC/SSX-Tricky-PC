@@ -1292,6 +1292,42 @@ static void scene_resolve(D3D8DeviceState *s)
             DXGI_FORMAT_R8G8B8A8_UNORM);
 }
 
+/* Diagnostic: one pixel of the scene target, (fx, fy) in 0..1 of its size,
+ * as 0xAARRGGBB. Resolves and reads back synchronously -- only for draw-log
+ * frames ("which draw turned this pixel black"). */
+unsigned d3d8_DebugPeekScene(float fx, float fy)
+{
+    D3D8DeviceState *s = &g_device_state;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_BOX box;
+    D3D11_MAPPED_SUBRESOURCE m;
+    static ID3D11Texture2D *stage;
+    unsigned x, y, v = 0xDEADBEEFu;
+    if (!s->scene_tex || !s->d3d11_context) return v;
+    scene_resolve(s);
+    ID3D11Texture2D_GetDesc(s->scene_tex, &td);
+    if (!stage) {
+        D3D11_TEXTURE2D_DESC sd;
+        memset(&sd, 0, sizeof sd);
+        sd.Width = 1; sd.Height = 1; sd.MipLevels = 1; sd.ArraySize = 1;
+        sd.Format = td.Format; sd.SampleDesc.Count = 1;
+        sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s->d3d11_device, &sd, NULL, &stage))) return v;
+    }
+    x = (unsigned)(fx * (float)td.Width);  if (x >= td.Width)  x = td.Width - 1;
+    y = (unsigned)(fy * (float)td.Height); if (y >= td.Height) y = td.Height - 1;
+    box.left = x; box.right = x + 1; box.top = y; box.bottom = y + 1; box.front = 0; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s->d3d11_context, (ID3D11Resource *)stage, 0, 0, 0, 0,
+                                              (ID3D11Resource *)s->scene_tex, 0, &box);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s->d3d11_context, (ID3D11Resource *)stage, 0,
+                                          D3D11_MAP_READ, 0, &m))) {
+        const unsigned char *p = (const unsigned char *)m.pData;   /* R8G8B8A8 */
+        v = ((unsigned)p[3] << 24) | ((unsigned)p[0] << 16) | ((unsigned)p[1] << 8) | p[2];
+        ID3D11DeviceContext_Unmap(s->d3d11_context, (ID3D11Resource *)stage, 0);
+    }
+    return v;
+}
+
 /* Follow the window: a resize, maximise or fullscreen toggle changes the
  * client area, and the swap chain is resized to match so the output is never
  * stretched by the window system. A minimised window keeps its buffers. */
@@ -1391,6 +1427,70 @@ static HRESULT save_scene_png(D3D8DeviceState *s, const WCHAR *path)
  * centred, with black bars where the window's shape differs -- then present.
  * A 1:1 fit is a plain copy, which is every automated run. Settings changed
  * from the window's menu take effect here, between frames. */
+/* The last finished frame, for titles that sample the previous frame buffer as
+ * a texture: SSX's chrome "Master" outfits reflect it, binding the buffer that
+ * was just shown as a linear texture (part 183). Frames only exist on the host,
+ * so guest RAM there is black. Copied from the scene target at each present,
+ * once something has asked for it (d3d8_PrevFrameTexture); the copy is an
+ * RGBA texture of the scene's own size wrapped in a D3D8 texture object, and
+ * the NV2A path normalises linear-texture coordinates by the image rect, so
+ * the render resolution does not matter. */
+static IDirect3DTexture8 *g_prev_frame;
+static unsigned           g_prev_frame_wanted;   /* present seq of the last request */
+
+static void prev_frame_update(D3D8DeviceState *s)
+{
+    D3D11_TEXTURE2D_DESC sd;
+    D3D8Texture *t;
+    if (!s->scene_tex || !g_prev_frame_wanted || g_present_seq - g_prev_frame_wanted > 120)
+        return;
+    ID3D11Texture2D_GetDesc(s->scene_tex, &sd);
+    t = (D3D8Texture *)g_prev_frame;
+    if (t && (t->width != sd.Width || t->height != sd.Height)) {
+        g_prev_frame->lpVtbl->Release(g_prev_frame);
+        g_prev_frame = NULL;
+        t = NULL;
+    }
+    if (!t) {
+        D3D11_TEXTURE2D_DESC td = sd;
+        ID3D11Texture2D *tex = NULL;
+        ID3D11ShaderResourceView *srv = NULL;
+        IDirect3DTexture8 *wrap = NULL;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc.Count = 1;
+        td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s->d3d11_device, &td, NULL, &tex)))
+            return;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s->d3d11_device,
+                        (ID3D11Resource *)tex, NULL, &srv)) ||
+            FAILED(d3d8_CreateTextureImpl(sd.Width, sd.Height, 1, 0, D3DFMT_A8R8G8B8, &wrap))) {
+            if (srv) ID3D11ShaderResourceView_Release(srv);
+            ID3D11Texture2D_Release(tex);
+            return;
+        }
+        t = (D3D8Texture *)wrap;
+        if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
+        if (t->d3d11_texture) ID3D11Texture2D_Release(t->d3d11_texture);
+        t->d3d11_texture = tex;
+        t->srv = srv;
+        t->dxgi_format = td.Format;
+        g_prev_frame = wrap;
+    }
+    ID3D11DeviceContext_CopyResource(s->d3d11_context,
+        (ID3D11Resource *)t->d3d11_texture, (ID3D11Resource *)s->scene_tex);
+}
+
+IDirect3DTexture8 *d3d8_PrevFrameTexture(void)
+{
+    g_prev_frame_wanted = g_present_seq ? g_present_seq : 1;
+    return g_prev_frame;
+}
+
 static HRESULT host_present(void)
 {
     D3D8DeviceState *s = &g_device_state;
@@ -1400,6 +1500,7 @@ static HRESULT host_present(void)
     if (!s->swap_chain) return E_FAIL;
     if (ctx && s->scene_tex) {
         scene_resolve(s);
+        prev_frame_update(s);
 
         /* A screenshot, if one was asked for. */
         if (s_shot_lock_ready == 1) {
@@ -1902,6 +2003,54 @@ static HRESULT __stdcall dev_Clear(IDirect3DDevice8 *self, DWORD Count, const D3
     }
 
     return S_OK;
+}
+
+/*
+ * A clear limited to the title's clear rectangle. The race intro and the
+ * winner camera end every frame by clearing the top and bottom rows of the
+ * surface to black (rects y 0..0 and 479..479, after a blue clear of rows
+ * 1..476 and ~1,200 draws). Clearing the whole target for those wiped the
+ * finished frame, so the screen was black unless the intro was skipped; it
+ * only ever showed when a slow frame (a draw log) made the clear present
+ * the frame first. ClearView (D3D11.1) takes rectangles for render targets;
+ * depth and stencil have no rectangle clear and are cleared whole, which
+ * is harmless for the end-of-frame strips and for per-viewport clears.
+ */
+void d3d8_ClearRect(DWORD flags, D3DCOLOR color, float z, DWORD stencil,
+                    unsigned x0, unsigned y0, unsigned x1, unsigned y1)
+{
+    D3D8DeviceState *s = &g_device_state;
+    UINT gw = s->guest_w ? s->guest_w : s->width, gh = s->guest_h ? s->guest_h : s->height;
+    static ID3D11DeviceContext1 *ctx1 = NULL;
+    static int tried = 0;
+
+    if ((flags & D3DCLEAR_TARGET) && s->default_rtv &&
+        !(x0 == 0 && y0 == 0 && x1 + 1 >= gw && y1 + 1 >= gh)) {
+        if (!tried) {
+            tried = 1;
+            if (FAILED(ID3D11DeviceContext_QueryInterface(s->d3d11_context,
+                           &IID_ID3D11DeviceContext1, (void **)&ctx1)))
+                ctx1 = NULL;
+        }
+        if (ctx1) {
+            float sx, sy;
+            D3D11_RECT r;
+            const FLOAT c[4] = { ((color >> 16) & 0xFF) / 255.0f, ((color >> 8) & 0xFF) / 255.0f,
+                                 (color & 0xFF) / 255.0f, ((color >> 24) & 0xFF) / 255.0f };
+            d3d8_GetGuestScale(&sx, &sy);
+            if (x1 >= gw) x1 = gw - 1;
+            if (y1 >= gh) y1 = gh - 1;
+            r.left = (LONG)(x0 * sx + 0.5f);
+            r.top = (LONG)(y0 * sy + 0.5f);
+            r.right = (LONG)((x1 + 1) * sx + 0.5f);
+            r.bottom = (LONG)((y1 + 1) * sy + 0.5f);
+            if (x0 <= x1 && y0 <= y1)
+                ID3D11DeviceContext1_ClearView(ctx1, (ID3D11View *)s->default_rtv, c, &r, 1);
+            flags &= ~(DWORD)D3DCLEAR_TARGET;
+        }
+    }
+    if (flags)
+        dev_Clear(NULL, 0, NULL, flags, color, z, stencil);
 }
 
 static HRESULT __stdcall dev_SetTransform(IDirect3DDevice8 *self, D3DTRANSFORMSTATETYPE State, const D3DMATRIX *pMatrix)

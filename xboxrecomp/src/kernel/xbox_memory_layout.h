@@ -72,6 +72,19 @@ extern "C" {
  *  to it no matter how much RAM this port maps. */
 #define XBOX_GPU_VISIBLE_END    (64u * 1024u * 1024u)
 
+/* The 64 MB of RAM is also visible uncached at 0x80000000 and write-combined
+ * at 0xF0000000. Guest code folds these in XBOX_PTR (recomp_types.h); host
+ * code that takes a guest address -- the kernel bridges -- folds with this.
+ * Contiguous memory is handed out in the uncached form, as the real kernel
+ * does (part 183: the title keys "already relocated" off bit 31 of heap
+ * pointers, and frees D3D buffers as `physical | 0x80000000`). */
+static inline uint32_t xbox_fold_ram_alias(uint32_t va)
+{
+    if (va >= 0x80000000u && va < 0x84000000u) return va & 0x7FFFFFFFu;
+    if (va >= 0xF0000000u && va < 0xF4000000u) return va & 0x03FFFFFFu;
+    return va;
+}
+
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
  * They are parsed from the XBE header at runtime in xbox_MemoryLayoutInit().
  * This allows the toolkit to work with ANY Xbox game without modification. */

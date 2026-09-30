@@ -21,6 +21,7 @@ IDirect3DDevice8 *d3d8_GetDevice(void);
  * need any of these declarations. === */
 
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi.h>
 
 /* ================================================================

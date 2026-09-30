@@ -30,7 +30,10 @@ SRC = os.path.join(PORT, "src")
 RECOMP = os.path.join(SRC, "recomp")
 GEN = os.path.join(RECOMP, "gen")
 BUILD = os.path.join(PORT, "build")
-GAME_EXE = os.path.join(BUILD, "SSX Tricky.exe")
+# SSX_GAME_EXE=<name or path> runs another executable, e.g. a test link
+# ("SSX Tricky test.exe") while the player's game holds the real one open --
+# the linker cannot replace a running .exe.
+GAME_EXE = os.path.join(BUILD, os.environ.get("SSX_GAME_EXE", "SSX Tricky.exe"))
 
 GAME_FILES = os.path.join(ROOT, "game_files" if REPO else "Game Data")
 XBE = os.path.join(GAME_FILES, "default.xbe")

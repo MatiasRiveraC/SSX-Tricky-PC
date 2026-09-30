@@ -14,6 +14,7 @@ player's is started by Explorer, a shortcut or the launcher's own process.
 import subprocess
 
 EXE = "SSX Tricky.exe"
+EXES = (EXE.lower(), "ssx tricky test.exe")   # the test link, see ssxpaths
 TEST_PARENTS = ("python", "py.exe", "pythonw", "bash", "sh.exe", "timeout",
                 "cmd.exe", "powershell", "pwsh", "mintty", "conhost")
 
@@ -36,7 +37,7 @@ def kill_test_instances():
     rows = _processes()
     names = {pid: name.lower() for pid, _, name in rows}
     for pid, ppid, name in rows:
-        if name.lower() != EXE.lower():
+        if name.lower() not in EXES:
             continue
         parent = names.get(ppid, "")
         if parent and not any(parent.startswith(t) for t in TEST_PARENTS):

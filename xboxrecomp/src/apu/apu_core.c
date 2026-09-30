@@ -496,6 +496,10 @@ static void se_frame(MCPXAPUState *d)
                         "idle-in-list %ld\n", frames, g_vp_voice_frames, peak,
                         (unsigned)d->regs[NV_PAPU_TVL2D], (unsigned)d->regs[NV_PAPU_TVL3D],
                         (unsigned)d->regs[NV_PAPU_TVLMP], g_vp_idle_seen);
+                {
+                    extern void apu_vp_voicelog_dump(MCPXAPUState *d);
+                    apu_vp_voicelog_dump(d);
+                }
                 fflush(stderr);
             }
         }

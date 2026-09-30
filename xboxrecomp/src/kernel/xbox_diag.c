@@ -67,6 +67,7 @@ static int diag_va_ok(uint32_t va, uint32_t len)
 {
     if (!g_xbox_mem_offset) return 0;
     if (len == 0) return 0;
+    va = xbox_fold_ram_alias(va);   /* heap pointers are 0x8xxxxxxx (part 183) */
     if (va > 0xFFFFFFFFu - len) return 0;
     /* RAM, plus the MMIO apertures we map above it. */
     if ((uint64_t)va + len <= (uint64_t)XBOX_TOTAL_RAM) return 1;
@@ -74,9 +75,9 @@ static int diag_va_ok(uint32_t va, uint32_t len)
     return 0;
 }
 
-static uint8_t  g8 (uint32_t va) { return *(volatile uint8_t  *)((uintptr_t)va + g_xbox_mem_offset); }
-static uint16_t g16(uint32_t va) { return *(volatile uint16_t *)((uintptr_t)va + g_xbox_mem_offset); }
-static uint32_t g32(uint32_t va) { return *(volatile uint32_t *)((uintptr_t)va + g_xbox_mem_offset); }
+static uint8_t  g8 (uint32_t va) { return *(volatile uint8_t  *)((uintptr_t)xbox_fold_ram_alias(va) + g_xbox_mem_offset); }
+static uint16_t g16(uint32_t va) { return *(volatile uint16_t *)((uintptr_t)xbox_fold_ram_alias(va) + g_xbox_mem_offset); }
+static uint32_t g32(uint32_t va) { return *(volatile uint32_t *)((uintptr_t)xbox_fold_ram_alias(va) + g_xbox_mem_offset); }
 
 
 /* ---- write watches -------------------------------------- */
@@ -123,7 +124,7 @@ static char     g_watch_rep[2048];
 static uint32_t g_watch_rep_va = 0;
 static int      g_watch_nan_only = 0;
 
-static void *diag_native(uint32_t va) { return (void *)((uintptr_t)va + g_xbox_mem_offset); }
+static void *diag_native(uint32_t va) { return (void *)((uintptr_t)xbox_fold_ram_alias(va) + g_xbox_mem_offset); }
 
 int xbox_diag_watch_add(uint32_t va) { return xbox_diag_watch_add_ex(va, 4); }
 
@@ -160,6 +161,33 @@ int xbox_diag_watch_add_ex(uint32_t va, uint32_t len)
     g_watch[g_watch_n].len = len;
     g_watch_n++;
     return 0;
+}
+
+/* Host code writing guest memory -- the file bridge's ReadFile -- fails on a
+ * watched page instead of faulting into the handler (ReadFile returns
+ * ERROR_NOACCESS), and a title whose file read fails can hang at boot: a
+ * startup watch on a page that a load later reads into stalled the game at
+ * its first frame (part 183). Bracket such writes: begin lifts protection on
+ * every watched page the range overlaps, and says so when it covers the
+ * watched field itself; end restores it. Returns whether anything was lifted. */
+int xbox_diag_watch_host_write(uint32_t va, uint32_t len, int begin)
+{
+    int i, lifted = 0;
+    if (!g_watch_n || !len) return 0;
+    for (i = 0; i < g_watch_n; i++) {
+        uint32_t pg = g_watch[i].page_va;
+        DWORD old;
+        if (!g_watch[i].active || va >= pg + 0x1000u || va + len <= pg) continue;
+        VirtualProtect(diag_native(pg), 0x1000, begin ? g_watch[i].old_prot : PAGE_READONLY, &old);
+        lifted = 1;
+        if (begin && va < g_watch[i].va + g_watch[i].len && va + len > g_watch[i].va) {
+            extern volatile unsigned g_last_loc;
+            fprintf(stderr, "  [WATCH] host file read writes Xbox VA 0x%08X (buffer 0x%08X+%u, after loc_%08X)\n",
+                    g_watch[i].va, va, len, (unsigned)g_last_loc);
+            fflush(stderr);
+        }
+    }
+    return lifted;
 }
 
 void xbox_diag_watch_clear(void)
@@ -272,6 +300,40 @@ int xbox_diag_handle_fault(void *vep)
                 p += _snprintf(rep + p, sizeof(rep) - p,
                         "    loc:   main=loc_%08X  last=loc_%08X\n",
                         g_main_loc, g_last_loc);
+                /* A write through a RAM mirror view is a wild pointer that
+                 * happened to wrap onto the watched field (part 183: a
+                 * 0x8D8AE800 store landed on a mesh part record at
+                 * 0x018AE800), so say so. */
+                if (fmirror)
+                    p += _snprintf(rep + p, sizeof(rep) - p,
+                            "    via RAM mirror %u: the guest pointer was 0x%08X + %u x %zu MB\n",
+                            fmirror, fva, fmirror, fstride >> 20);
+                /* The faulting thread's own frames. CaptureStackBackTrace
+                 * inside the handler stops at the exception dispatcher, so
+                 * unwind from the fault context instead: the first frame is
+                 * the generated line doing the write. */
+                {
+                    CONTEXT uc = *ep->ContextRecord;
+                    int f;
+                    p += _snprintf(rep + p, sizeof(rep) - p, "    faulting frames:");
+                    for (f = 0; f < 10 && uc.Rip && p < (int)sizeof(rep) - 32; f++) {
+                        DWORD64 img = 0;
+                        PRUNTIME_FUNCTION fe;
+                        p += _snprintf(rep + p, sizeof(rep) - p, " 0x%llX",
+                                (unsigned long long)(0x140000000ULL + (uc.Rip - base)));
+                        fe = RtlLookupFunctionEntry(uc.Rip, &img, NULL);
+                        if (!fe) {
+                            uc.Rip = *(DWORD64 *)(uintptr_t)uc.Rsp;
+                            uc.Rsp += 8;
+                        } else {
+                            PVOID hd = NULL;
+                            DWORD64 ef = 0;
+                            RtlVirtualUnwind(UNW_FLAG_NHANDLER, img, uc.Rip, fe, &uc, &hd, &ef, NULL);
+                        }
+                        if (uc.Rip < base || uc.Rip >= base + 0x4000000u) break;
+                    }
+                    p += _snprintf(rep + p, sizeof(rep) - p, "\n");
+                }
                 p += _snprintf(rep + p, sizeof(rep) - p,
                         "    native frames (link addrs for addr2line):\n");
                 for (k = 0; k < n && p < (int)sizeof(rep) - 32; k++)
@@ -701,11 +763,26 @@ static void cmd_help(diag_client *c)
         "find <va> <len> <val> scan a range for a 32-bit value (all hex)\n"
         "watch <va>            report who writes this page (to stderr)\n"
         "unwatch               clear all watches\n"
+        "shot <path.png>       save the next presented frame\n"
+        "press <button> [ms]   hold a pad-0 button (A B X Y BLACK WHITE START BACK\n"
+        "                      UP DOWN LEFT RIGHT) for ms, default 150\n"
         "quit                  close the connection\n"
         "OK\n");
 }
 
 /* ---- dispatch ------------------------------------------- */
+
+/* Set by the host (main.c) to d3d8_RequestScreenshot; used by `shot`. */
+void (*g_diag_shot_hook)(const wchar_t *path) = NULL;
+/* Set by the host to its input HLE; used by `press`. Returns 0 for an
+ * unknown button name. */
+int (*g_diag_press_hook)(const char *name, int ms) = NULL;
+/* Set by the host to nv2a_drawlog_arm; used by `drawlog`. */
+void (*g_diag_drawlog_hook)(int frames) = NULL;
+/* Set by the host to nv2a_skipprog_set; used by `skipprog`. */
+void (*g_diag_skipprog_hook)(uint32_t hash) = NULL;
+/* Set by the host to nv2a_ignored_dump; used by `ignored`. */
+void (*g_diag_ignored_hook)(void) = NULL;
 
 static int handle(diag_client *c, char *line)
 {
@@ -743,6 +820,85 @@ static int handle(diag_client *c, char *line)
                 g_last_loc, lmin, lmax);
         cprintf(c, "%u of 40 samples moved -- %s\n", changes,
                 changes ? "running" : "BLOCKED (same label throughout)");
+        cprintf(c, "OK\n");
+        return 1;
+    }
+    if (!strcmp(cmd, "shot")) {
+        /* shot <path.png>: save the next presented frame, as F12 does. The
+         * host sets the hook (the kernel library does not link against the
+         * renderer). */
+        wchar_t w[MAX_PATH];
+        if (!a1) { cprintf(c, "ERR usage: shot <path.png>\n"); return 1; }
+        if (!g_diag_shot_hook) { cprintf(c, "ERR no screenshot hook\n"); return 1; }
+        MultiByteToWideChar(CP_UTF8, 0, a1, -1, w, MAX_PATH);
+        g_diag_shot_hook(w);
+        cprintf(c, "OK\n");
+        return 1;
+    }
+    if (!strcmp(cmd, "press")) {
+        /* press <button> [ms]: hold a pad-0 button for ms (default 150), so a
+         * test can walk the menus one step at a time and look at each screen
+         * (`shot`) before choosing the next press. Names as
+         * XBOX_INPUT_AUTOPRESS: A B X Y BLACK WHITE START BACK UP DOWN LEFT
+         * RIGHT. */
+        if (!a1) { cprintf(c, "ERR usage: press <button> [ms]\n"); return 1; }
+        if (!g_diag_press_hook) { cprintf(c, "ERR no input hook\n"); return 1; }
+        if (!g_diag_press_hook(a1, a2 ? atoi(a2) : 150)) {
+            cprintf(c, "ERR unknown button '%s'\n", a1);
+            return 1;
+        }
+        cprintf(c, "OK\n");
+        return 1;
+    }
+    if (!strcmp(cmd, "drawlog")) {
+        /* drawlog [frames]: describe every program draw of the next frames
+         * (XBOX_NV2A_DRAWLOG output, to stderr), starting two presents from
+         * now -- for screens reached by hand, whose frame number is not
+         * known in advance. XBOX_NV2A_DRAWLOG_VERTS / _MODE still apply. */
+        if (!g_diag_drawlog_hook) { cprintf(c, "ERR no drawlog hook\n"); return 1; }
+        g_diag_drawlog_hook(a1 ? atoi(a1) : 1);
+        cprintf(c, "OK\n");
+        return 1;
+    }
+    if (!strcmp(cmd, "ignored")) {
+        /* ignored: print (to stderr) and reset the dropped NV2A method
+         * histogram; call once to reset, again after the scene of interest. */
+        if (!g_diag_ignored_hook) { cprintf(c, "ERR no ignored hook\n"); return 1; }
+        g_diag_ignored_hook();
+        cprintf(c, "OK\n");
+        return 1;
+    }
+    if (!strcmp(cmd, "stall")) {
+        /* stall <ms>: suspend every other thread for ms -- a deliberate
+         * hitch, to test whether some behaviour depends on frame time. */
+        DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        HANDLE held[256];
+        int nh = 0, ms = a1 ? atoi(a1) : 500;
+        THREADENTRY32 te;
+        if (snap == INVALID_HANDLE_VALUE) { cprintf(c, "ERR snapshot failed\n"); return 1; }
+        te.dwSize = sizeof te;
+        if (Thread32First(snap, &te)) {
+            do {
+                HANDLE th;
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == self || nh >= 256) continue;
+                th = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (!th) continue;
+                if (SuspendThread(th) != (DWORD)-1) held[nh++] = th;
+                else CloseHandle(th);
+            } while (Thread32Next(snap, &te));
+        }
+        CloseHandle(snap);
+        Sleep((DWORD)ms);
+        while (nh > 0) { nh--; ResumeThread(held[nh]); CloseHandle(held[nh]); }
+        cprintf(c, "OK\n");
+        return 1;
+    }
+    if (!strcmp(cmd, "skipprog")) {
+        /* skipprog <hex hash>|0: drop draws of the vertex program with that
+         * listing hash (as XBOX_NV2A_DRAWLOG prints it) until cleared. */
+        if (!g_diag_skipprog_hook) { cprintf(c, "ERR no skipprog hook\n"); return 1; }
+        g_diag_skipprog_hook(a1 ? (uint32_t)strtoul(a1, NULL, 16) : 0u);
         cprintf(c, "OK\n");
         return 1;
     }
@@ -812,7 +968,7 @@ static int handle(diag_client *c, char *line)
         if (!diag_va_ok(va, n)) { cprintf(c, "ERR range not mapped\n"); return 1; }
         f = fopen(path, "wb");
         if (!f) { cprintf(c, "ERR cannot open %s\n", path); return 1; }
-        fwrite((const void *)((uintptr_t)va + g_xbox_mem_offset), 1, n, f);
+        fwrite((const void *)((uintptr_t)xbox_fold_ram_alias(va) + g_xbox_mem_offset), 1, n, f);
         fclose(f);
         cprintf(c, "saved %u bytes\nOK\n", n);
         return 1;

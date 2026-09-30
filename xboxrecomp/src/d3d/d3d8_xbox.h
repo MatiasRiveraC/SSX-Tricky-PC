@@ -780,6 +780,9 @@ IDirect3DDevice8 *xbox_GetD3DDevice(void);
  */
 void d3d8_PresentFrame(void);
 unsigned d3d8_PresentSeq(void);
+/* The last presented frame as a texture, for titles that sample the previous
+ * frame buffer (part 183); NULL until the first present after a request. */
+IDirect3DTexture8 *d3d8_PrevFrameTexture(void);
 /* NV2A window clip as a scissor rectangle for game draws (part 182). */
 void d3d8_SetWindowClip(int on, long x0, long y0, long x1, long y1);
 int d3d8_WindowClipOn(void);
@@ -792,6 +795,13 @@ int d3d8_WindowClipOn(void);
 void d3d8_SetHostDisplay(unsigned render_w, unsigned render_h,
                          int widescreen, int fullscreen);
 void d3d8_GetGuestScale(float *sx, float *sy);
+
+/* NV2A CLEAR_SURFACE with its clear rectangle (part 183): x0..x1, y0..y1
+ * inclusive, in the title's pixels. flags as dev_Clear (1 target, 2 z,
+ * 4 stencil). The colour clear is limited to the rectangle; depth and
+ * stencil are cleared whole (D3D11 has no rectangle clear for them). */
+void d3d8_ClearRect(DWORD flags, D3DCOLOR color, float z, DWORD stencil,
+                    unsigned x0, unsigned y0, unsigned x1, unsigned y1);
 
 /* The game window's menu and keys (part 183). The window runs on a thread of
  * its own; these are called on it. create_menu builds the menu bar (NULL for

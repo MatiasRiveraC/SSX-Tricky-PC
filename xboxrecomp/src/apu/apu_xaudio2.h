@@ -23,6 +23,13 @@ int xa2_get_buffer_size(void);
 
 /* Buffers queued on the device and not yet played. */
 int xa2_queued(void);
-#define XA2_TARGET_QUEUED 4
+/* 16 x 256 samples = ~85 ms of queued audio. The buffers used to be 1024
+ * samples, and the frame thread renders one buffer in a single burst before
+ * waiting on the device: a title that refills its streaming ring ~1000
+ * samples ahead of the play cursor (SSX Tricky's EA mixer) had the last 32
+ * samples of every burst read last lap's data -- an exact copy of the sound
+ * 50 ms earlier, a click every 21 ms (part 183). Small buffers keep each
+ * burst well inside the title's lead. */
+#define XA2_TARGET_QUEUED 16
 
 #endif /* APU_XAUDIO2_H */

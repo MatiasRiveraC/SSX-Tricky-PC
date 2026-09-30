@@ -136,6 +136,29 @@ static int port_of(uint32_t handle)
  * NAME@T+DxN repeats: N presses, D seconds apart, from T -- "A@18+1.5x40"
  * taps A through every default menu choice to a race in about a minute
  * instead of the two that spaced single presses took (part 180). */
+static const struct { const char *name; WORD bit; int analog; } names[] = {
+    { "A", 0, 0 }, { "B", 0, 1 }, { "X", 0, 2 }, { "Y", 0, 3 },
+    { "BLACK", 0, 4 }, { "WHITE", 0, 5 },
+    { "START", 0x10, -1 }, { "BACK", 0x20, -1 }, { "UP", 0x01, -1 },
+    { "DOWN", 0x02, -1 }, { "LEFT", 0x04, -1 }, { "RIGHT", 0x08, -1 },
+};
+#define NNAMES (sizeof(names) / sizeof(names[0]))
+
+/* Live presses from the diag port (`press A 150`): the tick each button is
+ * held until. Written by the diag thread, read by the game's poll. */
+static volatile DWORD g_live_until[NNAMES];
+
+int xinput_hle_press(const char *name, int ms)
+{
+    unsigned k;
+    for (k = 0; k < NNAMES; k++)
+        if (!_stricmp(name, names[k].name)) {
+            g_live_until[k] = GetTickCount() + (DWORD)(ms > 0 ? ms : 150);
+            return 1;
+        }
+    return 0;
+}
+
 static void autopress_into(hle_state_t *s)
 {
     static int parsed = 0, n = 0;
@@ -143,18 +166,19 @@ static void autopress_into(hle_state_t *s)
     static DWORD t0 = 0;
     DWORD now = GetTickCount();
     int i;
+    unsigned k;
+    for (k = 0; k < NNAMES; k++)
+        if ((LONG)(g_live_until[k] - now) > 0) {
+            if (names[k].analog >= 0) s->Gamepad.bAnalogButtons[names[k].analog] = 0xFF;
+            else s->Gamepad.wButtons |= names[k].bit;
+        }
     if (!parsed) {
         const char *e = getenv("XBOX_INPUT_AUTOPRESS");
-        static const struct { const char *name; WORD bit; int analog; } names[] = {
-            { "A", 0, 0 }, { "B", 0, 1 }, { "X", 0, 2 }, { "Y", 0, 3 },
-            { "BLACK", 0, 4 }, { "WHITE", 0, 5 },
-            { "START", 0x10, -1 }, { "BACK", 0x20, -1 }, { "UP", 0x01, -1 },
-            { "DOWN", 0x02, -1 }, { "LEFT", 0x04, -1 }, { "RIGHT", 0x08, -1 },
-        };
         parsed = 1;
         t0 = now;
         while (e && *e && n < 256) {
-            char name[16]; unsigned k = 0; double sec;
+            char name[16]; double sec;
+            k = 0;
             while (*e && *e != '@' && k < sizeof(name) - 1) name[k++] = *e++;
             name[k] = 0;
             if (*e != '@') break;
@@ -168,7 +192,7 @@ static void autopress_into(hle_state_t *s)
                     if (reps < 1) reps = 1;
                 }
                 for (r = 0; r < reps && n < 256; r++)
-                    for (k = 0; k < sizeof(names) / sizeof(names[0]); k++)
+                    for (k = 0; k < NNAMES; k++)
                         if (!_stricmp(name, names[k].name)) {
                             ev[n].at_ms = (DWORD)((sec + step * (double)r) * 1000.0);
                             ev[n].bit = names[k].bit;

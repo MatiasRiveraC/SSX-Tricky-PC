@@ -1762,6 +1762,18 @@ void xbox_HeapFree(uint32_t xbox_va)
 {
     uint32_t base = 0, size = 0;
     if (!xbox_va) return;
+    /* Titles free contiguous memory through its uncached (0x80000000) or
+     * write-combined (0xF0000000) alias -- on an Xbox that is the address
+     * MmAllocateContiguousMemory returned. Ours hands out the physical form,
+     * so fold before the lookup, which otherwise misses and leaks the block. */
+    {
+        static int fold = -1;
+        if (fold < 0) { const char *e = getenv("XBOX_HEAPFREE_FOLD"); fold = !(e && e[0] == '0'); }
+        if (fold && xbox_va >= 0x80000000u && xbox_va < 0x84000000u)
+            xbox_va &= 0x7FFFFFFFu;
+        else if (fold && xbox_va >= 0xF0000000u && xbox_va < 0xF4000000u)
+            xbox_va &= 0x03FFFFFFu;
+    }
     if (!xbox_heap_owner_of(xbox_va, &base, &size, NULL, NULL, 0, NULL) || !size)
         return;
     /* Only low-region blocks are recycled: a block from above the GPU line,
@@ -1876,6 +1888,7 @@ int xbox_heap_owner_of(uint32_t va, uint32_t *out_base, uint32_t *out_size,
                        int *out_nframes)
 {
     int i, k;
+    va = xbox_fold_ram_alias(va);   /* contiguous blocks are handed out aliased */
     for (i = 0; i < g_ledger_n; i++) {
         if (va < g_ledger[i].va || va >= g_ledger[i].va + g_ledger[i].size) continue;
         if (out_base)  *out_base  = g_ledger[i].va;

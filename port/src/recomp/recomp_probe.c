@@ -109,6 +109,9 @@ static uint32_t eval_expr(scan_t *s)
         skip_ws(s);
         if (*s->p == '+')      { s->p++; v += eval_term(s); }
         else if (*s->p == '-') { s->p++; v -= eval_term(s); }
+        /* Bitwise AND, left to right like +/-: `[esp+8]&1==1` finds odd
+         * pointers, `eax&0xF!=0` misaligned ones. */
+        else if (*s->p == '&') { s->p++; v &= eval_term(s); }
         else return v;
     }
 }
@@ -211,11 +214,33 @@ void recomp_probe_hit(uint32_t addr)
         /* The thread id is printed unconditionally: guest registers are
          * __thread, so "which thread" is the first question whenever a probe
          * reports a value that could not have come from the expected caller. */
-        n = snprintf(line, sizeof(line), "  [PROBE] 0x%08X t%lu",
-                     addr, (unsigned long)GetCurrentThreadId());
+        {   /* ms since the first hit (QPC): latency questions need a clock */
+            static LARGE_INTEGER f, t0;
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            if (!f.QuadPart) { QueryPerformanceFrequency(&f); t0 = q; }
+            n = snprintf(line, sizeof(line), "  [PROBE] 0x%08X t%lu @%.1fms",
+                         addr, (unsigned long)GetCurrentThreadId(),
+                         (double)(q.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+        }
         for (k = 0; k < p->nshow && n > 0 && (size_t)n < sizeof(line); k++) {
             int bad = 0;
-            uint32_t v = eval(p->show[k], &bad);
+            uint32_t v;
+            if (!strcmp(p->show[k], "bt")) {
+                /* The host call stack is the guest call chain: translated
+                 * functions call each other directly, while the guest
+                 * return slot holds a dummy 0. Resolve the addresses with
+                 * `addr2line -f -e "SSX Tricky.exe"` (image base 0x140000000). */
+                void *fr[14];
+                unsigned short c = (unsigned short)CaptureStackBackTrace(1, 14, fr, NULL), j;
+                uintptr_t mb = (uintptr_t)GetModuleHandleW(NULL);
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " bt=");
+                for (j = 0; j < c && n > 0 && (size_t)n < sizeof(line); j++)
+                    n += snprintf(line + n, sizeof(line) - (size_t)n, "%s0x%llX", j ? "," : "",
+                                  (unsigned long long)(0x140000000ULL + ((uintptr_t)fr[j] - mb)));
+                continue;
+            }
+            v = eval(p->show[k], &bad);
             n += snprintf(line + n, sizeof(line) - (size_t)n, " %s=%s0x%08X",
                           p->show[k], bad ? "?" : "", v);
         }

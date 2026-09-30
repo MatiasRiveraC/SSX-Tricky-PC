@@ -77,6 +77,12 @@ static const path_rule s_rules[] = {
     { "\\??\\Y:\\",                           0, NULL,         NULL          },
     { "\\??\\y:\\",                           0, NULL,         NULL          },
     { "\\??\\T:\\",                           1, s_tdata_win,  s_tdata_posix },
+    /* XDeleteSaveGame (and XAPI's other save helpers) build "\??\U:\<dir>\"
+     * paths; without these the delete step of an overwrite got
+     * STATUS_OBJECT_PATH_NOT_FOUND and every overwrite said "Save Failed"
+     * (part 183). */
+    { "\\??\\U:\\",                           1, s_udata_win,  s_udata_posix },
+    { "\\??\\Z:\\",                           1, "\\Cache",    "/Cache"      },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
 

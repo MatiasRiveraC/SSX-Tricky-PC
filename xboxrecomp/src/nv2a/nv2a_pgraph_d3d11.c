@@ -208,6 +208,7 @@ static struct {
     uint32_t surface_clip_h;
     uint32_t surface_clip_v;
     uint32_t surface_color_offset;  /* SET_SURFACE_COLOR_OFFSET (0x0210) */
+    uint32_t prev_surface_offset;   /* the surface presented at the last flip */
     int      surface_offset_seen;
     int      frame_complete;        /* set when the render surface flips */
     int      flip_mode;             /* the title flips surfaces: present at flips only */
@@ -312,6 +313,7 @@ void pgraph_d3d11_init(void)
     g_pg.cull_face = 0x405;             /* BACK */
     g_pg.front_face = 0x901;            /* CCW */
     g_pg.zstencil_clear = 0xFFFFFF00u;
+    g_pg.clear_rect_h = g_pg.clear_rect_v = 0x0FFF0000u;   /* whole surface until set */
     g_pg.initialized = 1;
 
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
@@ -380,6 +382,38 @@ void pgraph_d3d11_set_mem_base(void *base, uint32_t size)
 {
     g_pg_mem_base = (uint8_t *)base;
     g_pg_mem_size = size;
+}
+
+/* XBOX_NV2A_DRAWLOG frame window; also armed live by the diag `drawlog`
+ * command (nv2a_drawlog_arm), for screens reached by hand. */
+static volatile int g_drawlog_lo = -2, g_drawlog_n = 1;
+
+/* Diag `skipprog <hash>`: drop every draw whose vertex program has that
+ * listing hash (the value XBOX_NV2A_DRAWLOG prints as "program %08X") --
+ * "what is this program drawing over" without a rebuild. 0 clears it. */
+static volatile uint32_t g_skip_prog;
+void nv2a_skipprog_set(uint32_t h) { g_skip_prog = h; }
+
+/* In draw-log frames with XBOX_NV2A_PEEK=x,y (0..1 of the frame): read the
+ * scene target's pixel back after each draw, clear and flip, to find the
+ * step that changes it (part 183, the black race intro). */
+unsigned d3d8_DebugPeekScene(float fx, float fy);
+static void peek_after(const char *what)
+{
+    static int on = -1;
+    static float px, py;
+    int f;
+    if (on < 0) { const char *e = getenv("XBOX_NV2A_PEEK"); on = e && sscanf(e, "%f,%f", &px, &py) == 2; }
+    f = (int)d3d8_PresentSeq();
+    if (!on || g_drawlog_lo < 0 || f < g_drawlog_lo || f >= g_drawlog_lo + g_drawlog_n) return;
+    fprintf(stderr, "[PEEK] f%d after %s: %08X\n", f, what, d3d8_DebugPeekScene(px, py));
+}
+
+void nv2a_drawlog_arm(int frames)
+{
+    g_drawlog_n = frames > 0 ? frames : 1;
+    g_drawlog_lo = (int)d3d8_PresentSeq() + 2;
+    fprintf(stderr, "[DRAWLOG] armed frames %d..%d\n", g_drawlog_lo, g_drawlog_lo + g_drawlog_n - 1);
 }
 
 /* Resolve an NV2A RAM offset to a host pointer. The Xbox GPU addresses main
@@ -509,6 +543,24 @@ static int va_slot_texcoord0(void)
 
 /* Diffuse colour as a packed D3DCOLOR (ARGB). */
 static uint32_t g_ignored_hist[0x2000 >> 2];
+
+/* Diag `ignored`: the dropped-method histogram since the last call, then
+ * reset -- "what does this scene send that we ignore". */
+void nv2a_ignored_dump(void)
+{
+    unsigned i, n = 0;
+    fprintf(stderr, "[NV2A] dropped methods since last dump:\n");
+    for (;;) {
+        unsigned best = 0, bi = 0;
+        for (i = 0; i < (0x2000 >> 2); i++)
+            if (g_ignored_hist[i] > best) { best = g_ignored_hist[i]; bi = i; }
+        if (!best || n++ >= 40) break;
+        fprintf(stderr, "    0x%04X  x%u\n", bi << 2, best);
+        g_ignored_hist[bi] = 0;
+    }
+    memset(g_ignored_hist, 0, sizeof g_ignored_hist);
+    fflush(stderr);
+}
 
 void pgraph_d3d11_report_ignored(void)
 {
@@ -908,6 +960,30 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
     IDirect3DTexture8 *tex = NULL;
     D3DLOCKED_RECT lr;
     HRESULT hr;
+    int linear = !tex_is_swizzled(color) && !tex_dxt_format(color, &xfmt, &block_bytes);
+
+    /* A linear image's size is its IMAGE_RECT; the format's log2 size fields
+     * are zero (they decoded as 1x1, so a linear texture was one texel). */
+    if (linear && g_pg.tex[stage].image_rect) {
+        w = g_pg.tex[stage].image_rect >> 16;
+        h = g_pg.tex[stage].image_rect & 0xFFFFu;
+    }
+    xfmt = 0; block_bytes = 0;
+
+    /* A linear texture at the frame buffer that was just presented is the
+     * previous frame, which exists only on the host: SSX's chrome "Master"
+     * outfits reflect it (part 183). Bind the D3D layer's copy of it; the
+     * shader normalises the coordinates by the image rect, so the copy's
+     * render resolution does not matter. Not cached -- it changes every frame. */
+    if (linear && offset && offset == g_pg.prev_surface_offset) {
+        IDirect3DTexture8 *pf = d3d8_PrevFrameTexture();
+        if (pf) {
+            g_pg.tex[stage].d3d = pf;
+            g_pg.tex[stage].d3d_offset = offset;
+            g_pg.tex[stage].d3d_format = fmt;
+            return pf;
+        }
+    }
 
     if (!dev || w == 0 || h == 0 || w > 4096 || h > 4096)
         return NULL;
@@ -964,6 +1040,7 @@ static IDirect3DTexture8 *tex_upload_impl(IDirect3DDevice8 *dev, int stage)
             sz = tex_is_swizzled(color) ? total : pitch * h;
         }
         sig = tex_sig(offset, sz);
+        if (linear) sig ^= g_pg.tex[stage].image_rect * 0x9E3779B1u;   /* same bytes, other shape */
         hit = texcache_find(offset, fmt, sig);
         if (hit) {
             g_pg.tex[stage].d3d = hit;
@@ -1492,8 +1569,20 @@ static void drawlog_program_draw(const uint32_t *indices, uint32_t v0, uint32_t 
     static unsigned seq;
     float in[16][4], out[VSHCPU_OUT_REGS][4];
     int a, st, nst = (int)(g_pg.comb_control & 0xFF);
+    {
+        static int dry2 = -1;
+        if (dry2 < 0) { const char *e = getenv("XBOX_NV2A_DRAWLOG_DRY"); dry2 = e && atoi(e) == 2; }
+        if (dry2) { Sleep(1); return; }
+    }
     for (a = 0; a < 16; a++) va_fetch4(a, v0, in[a]);
     vshcpu_run(g_pg.prog_dec, g_pg.prog_len, (const float (*)[4])in, g_pg.vconst, out);
+    {   /* XBOX_NV2A_DRAWLOG_DRY=1: stop here (the CPU work, no output);
+         * =2: skip the CPU work too and only sleep 1 ms per draw. Separates
+         * a side effect of the log from the time it takes (part 183). */
+        static int dry = -1;
+        if (dry < 0) { const char *e = getenv("XBOX_NV2A_DRAWLOG_DRY"); dry = e ? atoi(e) : 0; }
+        if (dry == 1) return;
+    }
     fprintf(stderr, "[DRAW]   depth func %X clip %g..%g vp z scale %g off %g\n", g_pg.depth_func,
             g_pg.clip_min, g_pg.clip_max, g_pg.vconst[0x3A][2], g_pg.vconst[0x3B][2]);
     fprintf(stderr, "[DRAW] f%u #%u mode %u n %u prog@%u blend %d %X/%X alphatest %d z %d/%d "
@@ -1551,11 +1640,30 @@ static void drawlog_program_draw(const uint32_t *indices, uint32_t v0, uint32_t 
             vshcpu_run(g_pg.prog_dec, g_pg.prog_len, (const float (*)[4])vin, g_pg.vconst, vout);
             fprintf(stderr, "[VERT] %4u #%-5u", k, vi);
             for (a = 0; a < 16; a++)
-                if (g_pg.vattr[a].format & 0xF0u)
-                    fprintf(stderr, " v%d(%g %g %g %g)", a, vin[a][0], vin[a][1], vin[a][2], vin[a][3]);
+                if ((g_pg.vattr[a].format & 0xF0u) || k == 0)   /* first vertex: constant registers too */
+                    fprintf(stderr, " v%d%s(%g %g %g %g)", a, (g_pg.vattr[a].format & 0xF0u) ? "" : "c",
+                            vin[a][0], vin[a][1], vin[a][2], vin[a][3]);
+            if (k == 0) {
+                /* XBOX_NV2A_DRAWLOG_CONSTS=LO-HI: those constant registers too
+                 * (default 98-99, the fog colour and parameters). */
+                static int clo = -1, chi = -1;
+                int ci;
+                if (clo < 0) {
+                    const char *e = getenv("XBOX_NV2A_DRAWLOG_CONSTS");
+                    clo = 98; chi = 99;
+                    if (e) sscanf(e, "%d-%d", &clo, &chi);
+                }
+                for (ci = clo; ci <= chi && ci < 192; ci++)
+                    fprintf(stderr, " c%d(%g %g %g %g)", ci, g_pg.vconst[ci][0], g_pg.vconst[ci][1],
+                            g_pg.vconst[ci][2], g_pg.vconst[ci][3]);
+            }
             for (a = 0; a < 4; a++)
                 fprintf(stderr, " oT%d(%g %g %g %g)", a, vout[VSHCPU_OUT_T0 + a][0],
                         vout[VSHCPU_OUT_T0 + a][1], vout[VSHCPU_OUT_T0 + a][2], vout[VSHCPU_OUT_T0 + a][3]);
+            fprintf(stderr, " oPos(%g %g %g %g) oD0(%g %g %g %g) oPts %g",
+                    vout[VSHCPU_OUT_POS][0], vout[VSHCPU_OUT_POS][1], vout[VSHCPU_OUT_POS][2], vout[VSHCPU_OUT_POS][3],
+                    vout[VSHCPU_OUT_D0][0], vout[VSHCPU_OUT_D0][1], vout[VSHCPU_OUT_D0][2], vout[VSHCPU_OUT_D0][3],
+                    vout[VSHCPU_OUT_PTS][0]);
             fprintf(stderr, "\n");
         }
     }
@@ -1857,14 +1965,13 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         /* XBOX_NV2A_PICK needs the CPU-transformed vertices: take the CPU
          * path, but only in the frames XBOX_NV2A_DRAWLOG selects, so the
          * run keeps GPU timing up to the frame being examined. */
-        static int pick_cpu = -1, lo = 0, nf = 1;
+        /* The window is g_drawlog_lo/n, so the diag `drawlog` command arms
+         * it live as well. */
+        static int pick_cpu = -1;
         int f = (int)d3d8_PresentSeq();
-        if (pick_cpu < 0) {
-            const char *dl = getenv("XBOX_NV2A_DRAWLOG");
-            pick_cpu = getenv("XBOX_NV2A_PICK") && dl;
-            if (dl) { lo = atoi(dl); if (strchr(dl, ':')) nf = atoi(strchr(dl, ':') + 1); }
-        }
-        gpu = !points && !(pick_cpu && f >= lo && f < lo + nf) && gpu_prepare(&gd, indices, start, count);
+        if (pick_cpu < 0) pick_cpu = getenv("XBOX_NV2A_PICK") != NULL;
+        gpu = !points && !(pick_cpu && g_drawlog_lo >= 0 && f >= g_drawlog_lo && f < g_drawlog_lo + g_drawlog_n)
+              && gpu_prepare(&gd, indices, start, count);
     }
     if (gpu) {
         n = gd.nindices;
@@ -1948,12 +2055,13 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
      * frames F..F+N-1 (numbered like the XBOX_D3D_DUMP frames) -- texture stages, combiners,
      * blend, and the first vertex's program outputs. */
     {
-        static int lo = -2, n_frames = 1;
-        if (lo == -2) {
+        int lo, n_frames;
+        if (g_drawlog_lo == -2) {
             const char *e = getenv("XBOX_NV2A_DRAWLOG");
-            lo = e ? atoi(e) : -1;
-            if (e && strchr(e, ':')) n_frames = atoi(strchr(e, ':') + 1);
+            g_drawlog_lo = e ? atoi(e) : -1;
+            if (e && strchr(e, ':')) g_drawlog_n = atoi(strchr(e, ':') + 1);
         }
+        lo = g_drawlog_lo; n_frames = g_drawlog_n;
         static int only_mode = -2;
         if (only_mode == -2) {   /* XBOX_NV2A_DRAWLOG_MODE=N: only draws of that primitive mode */
             const char *e = getenv("XBOX_NV2A_DRAWLOG_MODE");
@@ -1971,6 +2079,16 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
         if (!init) { const char *e = getenv("XBOX_NV2A_SKIPTEX"); init = 1; if (e) skip_off = (uint32_t)strtoul(e, NULL, 16); }
         if (skip_off && g_pg.tex[0].enabled && g_pg.tex[0].offset == skip_off)
             return;
+    }
+    if (g_skip_prog) {
+        uint32_t h = 2166136261u;
+        int k;
+        for (k = 0; k < g_pg.prog_len; k++) {
+            h = (h ^ g_pg.prog[(g_pg.prog_start + k) % VSHCPU_SLOTS][1]) * 16777619u;
+            h = (h ^ g_pg.prog[(g_pg.prog_start + k) % VSHCPU_SLOTS][2]) * 16777619u;
+            h = (h ^ g_pg.prog[(g_pg.prog_start + k) % VSHCPU_SLOTS][3]) * 16777619u;
+        }
+        if (h == g_skip_prog) return;
     }
     if (gpu) {
         /* n and prim come from gpu_prepare; the vertices never touch the CPU. */
@@ -2418,6 +2536,7 @@ static void draw_program(const uint32_t *indices, uint32_t start, uint32_t count
             }
         }
     }
+    peek_after("program draw");
     g_pg.stats.draw_calls++;
     g_pg.stats.vertices_submitted += count;
     g_pg.draws_since_present++;
@@ -2655,6 +2774,17 @@ static void submit_draw(void)
     uint32_t num_verts = g_pg.inline_count / g_pg.vert_stride;
     if (num_verts < 3)
         return;
+    {   /* In the XBOX_NV2A_DRAWLOG / diag `drawlog` frames: inline-array draws
+         * too, which the program draw log never saw (part 183). */
+        int f = (int)d3d8_PresentSeq();
+        if (g_drawlog_lo >= 0 && f >= g_drawlog_lo && f < g_drawlog_lo + g_drawlog_n) {
+            const uint32_t *v = g_pg.inline_data;
+            fprintf(stderr, "[DRAW] f%d INLINE mode %u n %u stride %u xf %u vsh %d blend %d %X/%X z %d | v0 %08X %08X %08X %08X %08X %08X\n",
+                    f, g_pg.draw_mode, num_verts, g_pg.vert_stride, g_pg.xf_mode, vsh_active(),
+                    g_pg.blend_enable, g_pg.blend_sfactor, g_pg.blend_dfactor, g_pg.depth_test,
+                    v[0], v[1], v[2], v[3], v[4], g_pg.vert_stride > 5 ? v[5] : 0);
+        }
+    }
 
     const uint32_t *src = g_pg.inline_data;
     int actual_prim_type = g_pg.d3d_prim_type;
@@ -2929,6 +3059,17 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 {
     if (!g_pg.initialized)
         return 0;
+    {   /* XBOX_NV2A_SUBCHLOG=N (diagnostic): the first N methods sent to a
+         * subchannel other than 0 -- 2D objects (surface copies, blits) that
+         * this 3D translator would otherwise read as NV097 methods. */
+        static int left = -1;
+        if (left < 0) { const char *e = getenv("XBOX_NV2A_SUBCHLOG"); left = e ? atoi(e) : 0; }
+        if (left > 0 && subchannel != 0) {
+            left--;
+            fprintf(stderr, "[SUBCH] %d method %04X param %08X present %u\n",
+                    subchannel, method, param, d3d8_PresentSeq());
+        }
+    }
 
     /* Vertex stream binding. These are strided ranges rather than single
      * methods, so they are matched ahead of the switch. Both were previously
@@ -3243,8 +3384,10 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
                         g_pg.surface_color_offset, param, g_pg.draws_since_present);
             }
         }
+        peek_after("frame (flip)");
         if (g_pg.surface_offset_seen && param != g_pg.surface_color_offset) {
             g_pg.frame_complete = 1;
+            g_pg.prev_surface_offset = g_pg.surface_color_offset;
             /* Part 182: a surface flip is the title's real frame boundary --
              * present here, and only here, once flips are seen. Presenting on
              * every clear (and on the pump's 16 ms fallback) showed each
@@ -3324,8 +3467,13 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             if (param & 0xF0) flags |= 1;  /* D3DCLEAR_TARGET */
             if (param & 0x01) flags |= 2;  /* D3DCLEAR_ZBUFFER */
             if (param & 0x02) flags |= 4;  /* D3DCLEAR_STENCIL */
-            dev->lpVtbl->Clear(dev, 0, NULL, flags, g_pg.clear_color, 1.0f, 0);
+            /* Only the clear rectangle (NV_PGRAPH_CLEARRECTX/Y: min in bits
+             * 0..11, max in 16..27, inclusive) -- see d3d8_ClearRect. */
+            d3d8_ClearRect(flags, g_pg.clear_color, 1.0f, 0,
+                           g_pg.clear_rect_h & 0xFFF, g_pg.clear_rect_v & 0xFFF,
+                           (g_pg.clear_rect_h >> 16) & 0xFFF, (g_pg.clear_rect_v >> 16) & 0xFFF);
         }
+        peek_after("clear");
         g_pg.stats.clears++;
         return 1;
     }

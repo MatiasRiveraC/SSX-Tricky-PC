@@ -23,12 +23,12 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-/* Six slots: the frame thread keeps XA2_TARGET_QUEUED of them filled (see
- * xa2_queued and throttle() in apu_core.c), so there is room for jitter on
- * both sides. With three, and a submit that dropped the buffer whenever all
- * three were queued, every pacing wobble became a click (part 179). */
-#define XA2_NUM_BUFS      6
+#define XA2_BUF_SAMPLES   256    /* ~5.3 ms per submission; see XA2_TARGET_QUEUED */
+/* The frame thread keeps XA2_TARGET_QUEUED of these filled (see xa2_queued
+ * and throttle() in apu_core.c), so there is room for jitter on both sides.
+ * With three, and a submit that dropped the buffer whenever all three were
+ * queued, every pacing wobble became a click (part 179). */
+#define XA2_NUM_BUFS      24
 static unsigned long g_xa2_underruns = 0, g_xa2_drops = 0;
 
 static IXAudio2               *g_xa2 = NULL;
@@ -177,6 +177,44 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
 
     IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+
+    {   /* XBOX_AUDIO_WAV=<path> (diagnostic, part 183): append exactly what is
+         * submitted to a 48 kHz 16-bit WAV, header patched as it grows, so a
+         * run's sound can be inspected rather than described. */
+        static FILE *wf = NULL;
+        static int init = 0;
+        static uint32_t bytes = 0;
+        if (!init) {
+            const char *p = getenv("XBOX_AUDIO_WAV");
+            init = 1;
+            if (p && *p) {
+                wf = fopen(p, "wb");
+                if (wf) {
+                    uint8_t h[44] = {0};
+                    fwrite(h, 1, 44, wf);
+                }
+            }
+        }
+        if (wf) {
+            uint32_t n = (uint32_t)xbuf.AudioBytes;
+            fwrite(xbuf.pAudioData, 1, n, wf);
+            bytes += n;
+            if ((g_xa2_frames_written & 31) == 0) {
+                long pos = ftell(wf);
+                uint32_t rate = 48000, byterate = 48000 * XA2_CHANNELS * 2, v;
+                uint16_t s;
+                fseek(wf, 0, SEEK_SET);
+                fwrite("RIFF", 1, 4, wf); v = 36 + bytes; fwrite(&v, 4, 1, wf);
+                fwrite("WAVEfmt ", 1, 8, wf); v = 16; fwrite(&v, 4, 1, wf);
+                s = 1; fwrite(&s, 2, 1, wf); s = XA2_CHANNELS; fwrite(&s, 2, 1, wf);
+                fwrite(&rate, 4, 1, wf); fwrite(&byterate, 4, 1, wf);
+                s = XA2_CHANNELS * 2; fwrite(&s, 2, 1, wf); s = 16; fwrite(&s, 2, 1, wf);
+                fwrite("data", 1, 4, wf); fwrite(&bytes, 4, 1, wf);
+                fseek(wf, pos, SEEK_SET);
+                fflush(wf);
+            }
+        }
+    }
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;

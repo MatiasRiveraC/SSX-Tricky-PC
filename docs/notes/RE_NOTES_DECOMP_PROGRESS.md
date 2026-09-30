@@ -10148,3 +10148,180 @@ taking the CPU path in the DRAWLOG frames.
 **Release build:** MinGW's `xinput` import library is XInput 1.3, missing on
 stock Windows 10/11; linked `xinput1_4` instead (xboxrecomp/src/input and the
 port's CMakeLists).
+
+### Part 183, continued -- the heap belongs at 0x80000000, and the outfit screen
+
+**Correction to the entry above:** "distant fog is ~10x too weak" was wrong.
+`FUN_000FD3E0` sets the per-course density to
+`[[lvl+0x80]+0x4B4] * (int)byte[lvl+0x78] * [0x1C0A30](=30) * 2e-5 + 1e-5`, and
+`InGameState_LoadLevel` sets `lvl+0x78` from `rand() < 0.03` on Garibaldi: dense
+fog is a 3% weather roll, and the normal 1e-5 is correct. The distant-texture
+report was a damaged body instead: **`sub_000F7830`** (far-LOD terrain patch
+splitter) had a duplicated x87 sequence and an `fxch` that should have been
+`fxch st(2)`, from an old post-pass; relifted, the shattered ground below the
+Garibaldi cliff is gone (user-verified run). What remains there is the mist:
+the FogVolume cloud quads land at z 1.002-1.014 in ours.
+
+**x87 sequence audit (`tools/audit/x87seq.py`).** Lists the x87 instruction
+comments of every generated body, in order, for the tree and for a fresh full
+translation, and reports every function where they differ (register operands
+normalised to two-operand form; memory operands ignored because fixfpmem adds
+them). Validated on the pre-fix backup of sub_000F7830. Over the whole tree
+(12,515 functions, 2,226 using x87) exactly one content difference remained:
+**`sub_0016E0B0`**, the D3D 4x4 matrix inverse used for
+`SET_INVERSE_MODEL_VIEW_MATRIX` (FUN_0016D730), with six `fxch st(2)`/`st(3)`
+lowered to `fxch`. Patched; every inverse model-view matrix the title uploaded
+was wrong. The other 35 are length differences (split/recovered boundaries,
+hand-written helpers).
+
+**Customize Outfit froze on the fourth outfit** (user request: test character
+select, outfits, boards, courses). Chain, each step measured:
+1. The asset loader's read targeted guest address 0 (`[READ] NULL buffer`, new
+   always-on diagnostic): `ASYNCFILE_load` allocates `"ASYNCFILEBUF"` with the
+   game heap and never checks for NULL.
+2. The heap was exhausted: its free list held a 12.7 MB block of size
+   `0x80C23B60` reached through `0x82B0A3F0`. `BoardMesh_ReleaseBuffers` frees
+   D3D buffers as `Heap_Free(physical | 0x80000000)`; the allocator compares
+   sizes signed, so a bit-31 size is never usable.
+3. On an Xbox that alias *is* the heap pointer: the heap comes from
+   `XPhysicalAlloc(size, 0xFFFFFFFF, 0, PAGE_READWRITE)` (FUN_00151380), and
+   contiguous memory lives at 0x80000000 + physical. Ours returned 0x00215000.
+4. The title also keys "already relocated" off bit 31: `sub_00103900` (board
+   shadow silhouette tables) skips conversion when `[tri+8]` is negative. With
+   positive heap pointers every outfit change relocated the table again
+   (0x01AA3000 -> 0x0852F000 -> 0x22F5F000 -> 0x8D81F000), and the per-frame
+   culling pass `sub_000FB8C0` wrote a byte per triangle through those pointers,
+   which wrapped through RAM mirror 16 onto a rider's mesh part table:
+   `DrawIndexedVertices(strip, 1422, 0x018AE8FF)` -> exploded riders.
+Fix: **contiguous memory is returned as `0x80000000 | physical`**
+(`xbox_contig_alias_ex`, kernel_bridge.c) for requests with no ceiling (the
+title heap). Blocks confined below 64 MB (D3D's push buffer and surfaces) stay
+plain for now: with an aliased ring D3D's `GET | 0x80000000` bounds test
+succeeds for the first time and boot stalls in `sub_0016B870` waiting for GET,
+which the NV2A emulation never writes back. `XBOX_CONTIG_ALIAS=0` restores
+plain addresses, `=2` aliases everything. Host code folds the aliases:
+`xbox_fold_ram_alias` (xbox_memory_layout.h) in BRIDGE_MEM8/16/32,
+XBOX_TO_NATIVE, MmGetPhysicalAddress, MmQueryAllocationSize, the dispatcher
+handle map, xbox_heap_owner_of, xbox_HeapFree and the diag reads. A first
+attempt that instead folded Heap_Free's argument back to the plain form was
+removed: with the heap aliased it mixes the forms the other way and the first
+allocation after boot fails (`D:\(null)`).
+Result: all five of Luther's outfits render like xemu (Knockout King, Star
+Power), heap free list sane, menucheck PASS, race 60 fps.
+
+Also found on the way: **`pushad`/`popad` were emitted as TODO comments** by the
+lifter (`sub_001033D0`'s popad never restored ebp after its SSE loop). Taught to
+the lifter and patched in the tree.
+
+Tooling added: diag `press <button> [ms]` (drive menus step by step with
+`shot`), diag `drawlog [frames]` (arm XBOX_NV2A_DRAWLOG live), probe show-token
+`bt` (host backtrace = guest call chain) and `&` in probe expressions, watch
+reports now unwind the faulting thread ("faulting frames") and flag writes that
+came through a RAM mirror, watches no longer break host file reads into the
+page (`xbox_diag_watch_host_write`), the file ledger merges repeated paths
+(256 rows).
+
+## Part 183, continued — saves, chrome, sound, and the black race intro
+
+**Hard-disk save ("Save Failed").** Five stacked causes, each hiding the next
+(details in memory `reference_hdd_save_pipeline`): (1) `shrd eax,edx,cl` with
+cl=0 emitted `edx << (32-0)` -- UB in C, and x86 masks the count, so the save
+folder's hex name (48-bit hash of the save name via `__aullshr` 0x15DA20) came
+out ...6C65 instead of ...6C64; the lifter now masks shld/shrd counts and skips
+count 0. (2) `\??\U:\` and `\??\Z:\` had no path rule (kernel_path.c).
+(3) `OBJECT_ATTRIBUTES.RootDirectory` was ignored: XAPI opens `Data.ssx`
+relative to a folder handle; kernel_bridge.c now keeps a guest-handle ->
+Xbox-path map (256 entries, dropped in NtClose). (4) Win32 delete-on-close left
+the deleted save folder pending, so XCreateSaveGame's recreate got
+ACCESS_DENIED; kernel_file.c deletes with FileDispositionInfoEx POSIX
+semantics. (5) **`std` was ignored by the lifter**: strrchr (0x15D780) scans
+backwards with `std; repne scasb`, found nothing, and the file name was taken
+from address 1; memmove's overlapping backward copy (0x15DC98) ran forwards.
+The lifter now tracks the direction flag per function for movs/stos/lods
+(`self._df`); `repne scas`/`repe cmps` are still emitted by the fixrepstr.py
+post-pass and print a TODO when DF is set. Saving, overwriting and loading a
+hard-disk save all work.
+
+**Elise's Master outfit (black instead of chrome).** The chrome material samples
+the *previous frame* -- the other colour buffer (0x03BA0000/0x03CCC000) bound as
+a linear texture whose size comes from IMAGE_RECT. Linear textures now take
+their size from the image rect (folded into the texture-cache signature), and
+a texture at the previous flip's surface offset binds a host copy of the last
+presented frame (`d3d8_PrevFrameTexture`, refreshed in host_present). The
+UBERBOARD is still black: its textures are right (t3 checked); the lighting
+input v0 is dark -- open.
+
+**Speech, countdown beeps and race-start sound were missing.** EA's software
+mixer renders 5.1 and hands each speaker to its own APU voice:
+69->FL (bin 0), 66->FR (1), 65->centre (2), 70->LFE (3), 68->rear L (4),
+67->rear R (5), each at volume 0x180 on its one bin (`XBOX_APU_VOICELOG=1` now
+prints all eight bin:volume pairs and the playback rate). The DSP stub sent
+bins 0/1 to the host and dropped the rest -- and every character line, the
+announcer, and the countdown sit in the centre voice (peak 0.87-0.92 in
+character select and at the start gate). apu_dsp.c now folds C and the rears
+into stereo (ITU-R BS.775, 0.7071, LFE omitted; `XBOX_AUDIO_DOWNMIX=0` for the
+old output). Measured: four 500 Hz beeps (1500 Hz harmonic) 0.5 s apart
+before GO, and a voice-band share of 0.34-0.48 in character select where it
+was 0.13-0.23.
+
+**The "slight noise".** `XBOX_AUDIO_WAV` recordings, second difference binned
+by position in the 1024-sample XAudio2 buffer: the last 32 samples of *every*
+buffer stepped at both edges (9x the median). That slice was a byte-exact copy
+of the output 2400 samples (50 ms) earlier: the frame thread renders one host
+buffer in a burst and then waits, and EA refills its stream ring ~1000 samples
+ahead of the play cursor, so the end of each burst read last lap's data. Host
+buffers are now 256 samples, 16 queued (the same ~85 ms): no position stands
+out (max 1.3-1.6x median), 1 stale slice in 11,975 (was one per buffer), 0
+underruns. The remaining period-4 texture is EA's own 36->48 kHz linear
+resample (the APU voices all play at rate 1.0).
+
+**Race intro camera black unless skipped.** Every intro frame is: clear rows
+1..476 to 0xFF3473C3, ~1,180 draws through a 640x360 viewport, then clear
+row 0 and row 479 to black, then flip. `CLEAR_SURFACE` ignored
+`SET_CLEAR_RECT_HORIZONTAL/VERTICAL` and cleared the whole target, so the two
+one-row strips erased the finished frame. It had looked timing-dependent: a
+draw-logged frame was always lit, because the log slowed the frame past the
+250 ms flip window and the clear handler then presented the frame before
+wiping it (`XBOX_NV2A_DRAWLOG_DRY=1` -- CPU work only -- stayed black; `=2`, a
+1 ms sleep per draw, was lit). Clears now go through `d3d8_ClearRect`: colour
+limited to the rectangle with `ID3D11DeviceContext1::ClearView` (scaled to the
+scene target), depth/stencil cleared whole (no rectangle clear exists for
+them). The clear rect defaults to the whole surface until the title sets one.
+The intro now shows the letterboxed rider shots; menucheck PASS. The intro's
+length varies run to run (0-10 s): it covers the course stream-in, so a warm
+file cache shortens it.
+
+**Tooling.** walkcap.py turns the diag server on (DIAGPORT, default 7650) and,
+when a run dumps no frame at all (about one boot in a dozen stalls before the
+title font loads -- not reproduced in 10 further boots), saves `loc` and
+`threads` to OUTDIR/hang.txt before killing it. The diag `drawlog` prints the
+frames it armed. `XBOX_AUDIO_WAV=<path>` records exactly what reaches XAudio2.
+
+**User test after these fixes (2026-09-30).** The finish camera (rider stops,
+camera circles, FINISH + time) and the Quarter Final Results screen render.
+Reported still open:
+- *No intro sequence*: the race went straight to the rider list. Now a skip,
+  not a black screen. Our runs saw the intro last anywhere from 0 to ~10 s
+  with no button pressed (xemu shows a course fly-over, then the rider
+  cutscene). Not yet traced; the intro is the `PreRace` state
+  (`RaceState_SetState`, 0x0002CE10).
+- *Character dialogue a little delayed*. Measured so far: EA's mixer
+  (`sub_00018430`) renders 512-sample blocks on the stream thread's 10 ms tick
+  (`sub_000151F0`: Enter CS, service, Leave CS, sleep to the next 10 ms
+  deadline). A new stream's producer (`vt[1]` of source+0x44, resampler
+  `sub_00019950` -> decoder) returns 0 until its data is buffered: the first
+  music start returned 0 for 35 ticks (~350 ms). `0x00018467` fires every
+  tick for positioned sounds -- that is `sub_00017C20`, a 32-sample de-click
+  gain ramp, not a restart. `bridge_NtReadFile` drops the Event/APC
+  arguments, but the stream reads are synchronous XAPI `ReadFile`
+  (`FUN_00152a33` with no OVERLAPPED; only the save code passes one), so
+  that is not the cause. Next: probe 0x184A6 (`eax==0`, armed live after the
+  music starts) per source slot against the speech trigger time.
+- UBERBOARD still black (lighting colour v0 dark); the character-select
+  name boards may share the cause (xemu comparison: the Elise board is
+  dimmer and bluer in ours).
+
+Probe hits now carry a millisecond timestamp (`@12.3ms`, recomp_probe.c).
+While the player's game holds `SSX Tricky.exe` open the linker cannot replace
+it: link `SSX Tricky test.exe` from the same objects and run tools with
+`SSX_GAME_EXE="SSX Tricky test.exe"` (ssxpaths.py; stale.py cleans up both).

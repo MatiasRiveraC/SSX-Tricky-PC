@@ -204,6 +204,7 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+static int vlog_on(void);   /* XBOX_APU_VOICELOG, defined below */
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
@@ -223,6 +224,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        if (vlog_on())
+            fprintf(stderr, "[VOICE] on %u fmt %08X list %u\n", (unsigned)selected_handle,
+                    (unsigned)voice_get_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                    (unsigned)GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST));
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -998,6 +1003,37 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+/* XBOX_APU_VOICELOG=1 (diagnostic, part 183): per-voice activity -- which
+ * voices were mixed in each 5 s window, their format and the loudest sample
+ * they produced before volume, and the volumes/bins they were mixed with.
+ * Answers "is this sound a voice at all, and is it silent before or after
+ * the volume stage". */
+static int g_vlog = -1;
+static struct { unsigned frames; float peak; uint32_t fmt; uint16_t vol[8]; uint8_t bin[8]; float ea, rate; } g_vl[MCPX_HW_MAX_VOICES];
+static int vlog_on(void)
+{
+    if (g_vlog < 0) { const char *e = getenv("XBOX_APU_VOICELOG"); g_vlog = e && e[0] == '1'; }
+    return g_vlog;
+}
+void apu_vp_voicelog_dump(MCPXAPUState *d)
+{
+    int v, n = 0;
+    (void)d;
+    if (!vlog_on()) return;
+    for (v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        if (!g_vl[v].frames) continue;
+        int k;
+        fprintf(stderr, "[VOICE] %3d frames %5u peak %.4f ea %.2f rate %.4f fmt %08X  bin:vol",
+                v, g_vl[v].frames, g_vl[v].peak, g_vl[v].ea, g_vl[v].rate, g_vl[v].fmt);
+        for (k = 0; k < 8; k++)
+            fprintf(stderr, " %u:%03X", g_vl[v].bin[k], g_vl[v].vol[k]);
+        fprintf(stderr, "\n");
+        g_vl[v].frames = 0; g_vl[v].peak = 0.0f;
+        n++;
+    }
+    fprintf(stderr, "[VOICE] %d voice(s) mixed in the window\n", n);
+}
+
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
@@ -1120,6 +1156,23 @@ static void voice_process(MCPXAPUState *d,
     for (int i = 0; i < 8; i++) {
         dbg->bin[i] = (uint8_t)bin[i];
         dbg->vol[i] = vol[i];
+    }
+    if (vlog_on()) {
+        float pk = g_vl[v].peak;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = fabsf(samples[i][0]), b = fabsf(samples[i][1]);
+            if (a > pk) pk = a;
+            if (b > pk) pk = b;
+        }
+        g_vl[v].peak = pk;
+        g_vl[v].frames++;
+        g_vl[v].fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+        for (int k = 0; k < 8; k++) {
+            g_vl[v].vol[k] = vol[k];
+            g_vl[v].bin[k] = (uint8_t)bin[k];
+        }
+        g_vl[v].ea = ea_value;
+        g_vl[v].rate = dbg->rate;
     }
 
     if (voice_should_mute(v)) return;

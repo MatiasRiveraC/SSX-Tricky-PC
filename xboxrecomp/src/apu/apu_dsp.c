@@ -68,11 +68,30 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    /* Fold the other speaker bins into the stereo pair (part 183). A title
+     * that mixes for 5.1 puts dialogue in the centre bin and ambience in the
+     * rears -- SSX Tricky's EA mixer feeds one APU voice per speaker bin
+     * (69->FL, 66->FR, 65->C, 70->LFE, 68->SL, 67->SR), and every character
+     * line, the countdown and the announcer sit in the centre voice. The real
+     * DSP's output stage downmixes them for the analog stereo jack; taking
+     * bins 0/1 alone dropped them. ITU-R BS.775 coefficients, LFE omitted.
+     * XBOX_AUDIO_DOWNMIX=0 restores the old front-only output. */
+    static int downmix = -1;
+    if (downmix < 0) {
+        const char *e = getenv("XBOX_AUDIO_DOWNMIX");
+        downmix = !(e && e[0] == '0');
+    }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Clamp to [-1, 1] range */
             float left = mixbins[0][i];
             float right = mixbins[1][i];
+            if (downmix) {
+                const float k = 0.70710678f;
+                left  += k * (mixbins[2][i] + mixbins[4][i]);
+                right += k * (mixbins[2][i] + mixbins[5][i]);
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;

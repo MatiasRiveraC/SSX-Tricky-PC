@@ -966,6 +966,20 @@ class Lifter:
             return self._lift_push(insn, ops)
         if m == "pop":
             return self._lift_pop(insn, ops)
+        if m in ("pushal", "pushad"):
+            # Emitted as a TODO until part 183, so the popal that pairs with
+            # it never restored anything: sub_001033D0 (board shadow
+            # silhouettes) kept a clobbered ebp after its SSE loop, read its
+            # object from the wrong frame and wrote a byte per triangle
+            # through wild pointers every frame -- onto whatever the heap put
+            # there, a rider's mesh part table once the free list worked.
+            return ["{ uint32_t _sp = esp; PUSH32(esp, eax); PUSH32(esp, ecx); "
+                    "PUSH32(esp, edx); PUSH32(esp, ebx); PUSH32(esp, _sp); "
+                    "PUSH32(esp, ebp); PUSH32(esp, esi); PUSH32(esp, edi); } /* pushal */"]
+        if m in ("popal", "popad"):
+            return ["{ uint32_t _dead; POP32(esp, edi); POP32(esp, esi); POP32(esp, ebp); "
+                    "POP32(esp, _dead); POP32(esp, ebx); POP32(esp, edx); POP32(esp, ecx); "
+                    "POP32(esp, eax); (void)_dead; } /* popal */"]
 
         # ── Arithmetic ──
         if m in ("add", "sub", "and", "or", "xor"):
@@ -1037,7 +1051,15 @@ class Lifter:
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
         if m in ("cld", "std"):
-            return [f"/* {m} - direction flag */"]
+            # The direction flag, tracked statically within the function:
+            # both std sites in SSX are straight-line std / string op / cld
+            # (strrchr, memmove's backward copy), and emitting them as
+            # comments made both run forwards (part 183 -- every hard-disk
+            # save failed). Blocks are lifted in address order, so this is
+            # exact for that idiom.
+            self._df_state()
+            self._df = (m == "std")
+            return [f"/* {m} - direction flag {'set' if self._df else 'clear'} */"]
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
@@ -1252,8 +1274,19 @@ class Lifter:
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
         cnt = _fmt_operand_read(ops[2])
-        return [_fmt_operand_write(ops[0],
-            f"({dst} << {cnt}) | ({src} >> (32 - {cnt}))") + " /* shld */"]
+        if ops[2].type == "imm":
+            n = ops[2].imm & 31
+            if n == 0:
+                return ["/* shld by 0: no change */"]
+            return [_fmt_operand_write(ops[0],
+                f"({dst} << {n}) | ({src} >> {32 - n})") + " /* shld */"]
+        # x86 masks the count to 5 bits and a count of 0 changes nothing;
+        # `src >> (32 - 0)` is undefined in C and on x86 shifts by 0, which
+        # ORed the whole source in (part 183: __aullshr by 0 turned the save
+        # folder 201120EF6C64 into ...6C65, so every hard-disk save failed).
+        return [f"{{ uint32_t _n = (uint32_t)({cnt}) & 31u; if (_n) "
+                + _fmt_operand_write(ops[0], f"({dst} << _n) | ({src} >> (32u - _n))")
+                + " } /* shld */"]
 
     def _lift_shrd(self, insn, ops):
         """SHRD: double-precision shift right."""
@@ -1262,8 +1295,16 @@ class Lifter:
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
         cnt = _fmt_operand_read(ops[2])
-        return [_fmt_operand_write(ops[0],
-            f"({dst} >> {cnt}) | ({src} << (32 - {cnt}))") + " /* shrd */"]
+        if ops[2].type == "imm":
+            n = ops[2].imm & 31
+            if n == 0:
+                return ["/* shrd by 0: no change */"]
+            return [_fmt_operand_write(ops[0],
+                f"({dst} >> {n}) | ({src} << {32 - n})") + " /* shrd */"]
+        # See _lift_shld: a count of 0 must change nothing.
+        return [f"{{ uint32_t _n = (uint32_t)({cnt}) & 31u; if (_n) "
+                + _fmt_operand_write(ops[0], f"({dst} >> _n) | ({src} << (32u - _n))")
+                + " } /* shrd */"]
 
     def _lift_imul(self, insn, ops):
         nops = len(ops)
@@ -1535,7 +1576,27 @@ class Lifter:
 
     # ── String operations ──
 
+    def _df_state(self):
+        """Direction flag for the current function (reset at each new one)."""
+        if getattr(self, "_df_func", None) != self.func_start:
+            self._df_func = self.func_start
+            self._df = False
+        return self._df
+
     def _lift_rep_string(self, insn, m):
+        if self._df_state():
+            # Descending (std): element by element from the given addresses
+            # down, as the hardware does; overlapping ranges stay correct.
+            for op, sz, mem in (("movsb", 1, "MEM8"), ("movsw", 2, "MEM16"), ("movsd", 4, "MEM32")):
+                if op in m:
+                    return [f"{{ uint32_t _i; for (_i = 0; _i < ecx; _i++) {mem}(edi - _i*{sz}) = {mem}(esi - _i*{sz}); }}",
+                            f"esi -= ecx * {sz}; edi -= ecx * {sz}; ecx = 0; /* std; rep {op} */"]
+            for op, sz, mem, val in (("stosb", 1, "MEM8", "LO8(eax)"), ("stosw", 2, "MEM16", "LO16(eax)"),
+                                     ("stosd", 4, "MEM32", "eax")):
+                if op in m:
+                    return [f"{{ uint32_t _i; for (_i = 0; _i < ecx; _i++) {mem}(edi - _i*{sz}) = {val}; }}",
+                            f"edi -= ecx * {sz}; ecx = 0; /* std; rep {op} */"]
+            return [f"/* TODO: {m} with the direction flag set */"]
         if "movsb" in m:
             return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);",
                     "esi += ecx; edi += ecx; ecx = 0; /* rep movsb */"]
@@ -1565,6 +1626,17 @@ class Lifter:
         return [f"/* {m} */"]
 
     def _lift_string_op(self, insn, m):
+        if self._df_state():
+            sz = {"b": 1, "w": 2, "d": 4}[m[-1]]
+            mem = {1: "MEM8", 2: "MEM16", 4: "MEM32"}[sz]
+            reg = {1: "LO8(eax)", 2: "LO16(eax)", 4: "eax"}[sz]
+            if m.startswith("movs"):
+                return [f"{mem}(edi) = {mem}(esi); esi -= {sz}; edi -= {sz}; /* std; {m} */"]
+            if m.startswith("stos"):
+                return [f"{mem}(edi) = {reg}; edi -= {sz}; /* std; {m} */"]
+            if m.startswith("lods"):
+                load = {1: "SET_LO8(eax, MEM8(esi))", 2: "SET_LO16(eax, MEM16(esi))", 4: "eax = MEM32(esi)"}[sz]
+                return [f"{load}; esi -= {sz}; /* std; {m} */"]
         if m == "movsb":
             return ["MEM8(edi) = MEM8(esi); esi++; edi++; /* movsb */"]
         if m == "movsd":

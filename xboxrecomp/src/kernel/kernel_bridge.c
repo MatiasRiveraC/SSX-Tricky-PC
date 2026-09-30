@@ -55,10 +55,10 @@ recomp_func_t recomp_lookup(uint32_t xbox_va);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Memory access - same as recomp_types.h MEM32 but without the #define guard */
-#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)xbox_fold_ram_alias((uint32_t)(addr)) + g_xbox_mem_offset))
 
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
-#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
+#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)xbox_fold_ram_alias((uint32_t)(va)) + g_xbox_mem_offset) : NULL)
 
 /* ── Dispatcher-object VA -> native HANDLE resolution ──────
  * Real Xbox kernel dispatcher objects (KEVENT, KSEMAPHORE, ...) are structs
@@ -87,6 +87,9 @@ static HANDLE xbox_resolve_dispatcher_handle(uint32_t obj_va)
      * values that actually look like Xbox memory addresses go through the
      * lazy-synthesis path below. */
     if (obj_va < XBOX_BASE_ADDRESS) return (HANDLE)(uintptr_t)obj_va;
+    /* One object, one key: an object in contiguous memory can be named by
+     * its 0x80000000 alias or its plain address. */
+    obj_va = xbox_fold_ram_alias(obj_va);
 
     for (i = 0; i < g_dispatcher_handle_count; i++) {
         if (g_dispatcher_handle_keys[i] == obj_va) return g_dispatcher_handle_values[i];
@@ -178,8 +181,8 @@ void xbox_io_port_write(uint16_t port, int width, uint32_t value)
  * it with the expected structures.
  */
 
-#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
-#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)xbox_fold_ram_alias((uint32_t)(addr)) + g_xbox_mem_offset))
+#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)xbox_fold_ram_alias((uint32_t)(addr)) + g_xbox_mem_offset))
 
 /**
  * Get the Xbox VA of data for a kernel DATA export ordinal.
@@ -629,6 +632,8 @@ static void bridge_PsCreateSystemThreadEx(void)
 static void   bridge_write_handle(uint32_t handle_va, HANDLE h);
 static HANDLE bridge_take_handle(uint32_t token);
 
+static void hpath_drop(uint32_t tok);   /* handle -> path map, below */
+
 static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
@@ -637,6 +642,7 @@ static void bridge_NtClose(void)
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
+    hpath_drop(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -647,6 +653,31 @@ static void bridge_NtClose(void)
     g_eax = 0; /* STATUS_SUCCESS */
 }
 
+/* Contiguous memory is returned as its uncached alias, 0x80000000 + physical,
+ * as the Xbox kernel returns it (part 183). The title depends on that: it
+ * treats a negative value in a mesh's triangle table as "already relocated"
+ * (sub_00103900), so with plain addresses every outfit change relocated the
+ * board-shadow table again until its pointers wrapped onto a rider's mesh
+ * parts; and it frees D3D buffers as `physical | 0x80000000`. The heap it
+ * builds on the 54 MB block therefore has to live at the alias too.
+ *
+ * Not yet for blocks the caller confines below 64 MB (high < 0xFFFFFFFF):
+ * those are D3D's push buffer and surfaces, and D3D's flow control compares
+ * `GET | 0x80000000` against the ring's bounds. With an aliased ring that
+ * test finally succeeds, D3D waits for GET to advance -- and the NV2A
+ * emulation never writes GET back, so boot stalls in sub_0016B870. Until it
+ * does, those stay plain (the mixed forms D3D has always run with here).
+ * XBOX_CONTIG_ALIAS=0 restores plain addresses everywhere, =2 aliases all. */
+static uint32_t xbox_contig_alias_ex(uint32_t va, uint32_t high)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XBOX_CONTIG_ALIAS"); on = e ? atoi(e) : 1; }
+    if (!on || !va || va >= XBOX_GPU_VISIBLE_END) return va;
+    if (on == 1 && high < 0xFFFFFFFFu) return va;
+    return va | 0x80000000u;
+}
+static uint32_t xbox_contig_alias(uint32_t va) { return xbox_contig_alias_ex(va, 0xFFFFFFFFu); }
+
 /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
  * PVOID MmAllocateContiguousMemory(ULONG NumberOfBytes)
  */
@@ -655,7 +686,7 @@ static void bridge_MmAllocateContiguousMemory(void)
     uint32_t size = STACK_ARG(0);
 
     /* Allocate from Xbox heap so MEM32(result) works correctly */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    uint32_t xbox_va = xbox_contig_alias(xbox_HeapAlloc(size, 4096));
 
     if (g_kernel_call_count <= 100) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
@@ -718,7 +749,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     if (xbox_va && size >= 0x100000u && size <= 0x400000u)
         nv2a_live_pb_note_ring(xbox_va, size);
 
-    g_eax = xbox_va;
+    g_eax = xbox_contig_alias_ex(xbox_va, high);
 }
 
 /* Mirrors XBOX_FAKE_KERNEL_HEADER_VA for recomp_types.h's
@@ -1289,10 +1320,11 @@ static void bridge_NtYieldExecution(void)
 static void bridge_MmGetPhysicalAddress(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* Xbox uses identity mapping (physical == virtual) for the lower 64MB.
-     * Just return the Xbox VA as-is. Don't call xbox_MmGetPhysicalAddress
-     * which would return a native pointer. */
-    g_eax = addr;
+    /* Xbox uses identity mapping (physical == virtual) for the lower 64MB,
+     * and contiguous memory is handed out as its 0x80000000 alias, so fold
+     * the alias. Don't call xbox_MmGetPhysicalAddress, which would return a
+     * native pointer. */
+    g_eax = xbox_fold_ram_alias(addr);
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -1838,6 +1870,69 @@ static void bridge_RtlNtStatusToDosError(void)
  *   offset 4: Information     (uint32_t)
  */
 
+/* The Xbox path each open handle was opened with, so an OBJECT_ATTRIBUTES
+ * whose RootDirectory is a handle can be resolved: XAPI opens a save folder
+ * and then its files by bare name relative to it (XDeleteSaveGame deletes
+ * "Data.ssx" that way), and those relative opens all failed with
+ * STATUS_OBJECT_NAME_NOT_FOUND (part 183). Keyed by the guest's handle value. */
+#define XBOX_HANDLE_PATHS 256
+static struct { uint32_t tok; char path[260]; } s_hpath[XBOX_HANDLE_PATHS];
+static CRITICAL_SECTION s_hpath_cs;
+static volatile LONG s_hpath_init = 0;
+
+static void hpath_lock(void)
+{
+    if (InterlockedCompareExchange(&s_hpath_init, 1, 0) == 0) {
+        InitializeCriticalSection(&s_hpath_cs);
+        s_hpath_init = 2;
+    }
+    while (s_hpath_init != 2) Sleep(0);
+    EnterCriticalSection(&s_hpath_cs);
+}
+
+static void hpath_set(uint32_t tok, const char *path)
+{
+    int i, slot = -1;
+    if (!tok || !path) return;
+    hpath_lock();
+    for (i = 0; i < XBOX_HANDLE_PATHS; i++) {
+        if (s_hpath[i].tok == tok) { slot = i; break; }
+        if (!s_hpath[i].tok && slot < 0) slot = i;
+    }
+    if (slot >= 0) {
+        s_hpath[slot].tok = tok;
+        strncpy(s_hpath[slot].path, path, sizeof s_hpath[slot].path - 1);
+        s_hpath[slot].path[sizeof s_hpath[slot].path - 1] = 0;
+    }
+    LeaveCriticalSection(&s_hpath_cs);
+}
+
+static int hpath_get(uint32_t tok, char *out, size_t cap)
+{
+    int i, ok = 0;
+    if (!tok) return 0;
+    hpath_lock();
+    for (i = 0; i < XBOX_HANDLE_PATHS; i++)
+        if (s_hpath[i].tok == tok) {
+            strncpy(out, s_hpath[i].path, cap - 1);
+            out[cap - 1] = 0;
+            ok = 1;
+            break;
+        }
+    LeaveCriticalSection(&s_hpath_cs);
+    return ok;
+}
+
+static void hpath_drop(uint32_t tok)
+{
+    int i;
+    if (!tok) return;
+    hpath_lock();
+    for (i = 0; i < XBOX_HANDLE_PATHS; i++)
+        if (s_hpath[i].tok == tok) s_hpath[i].tok = 0;
+    LeaveCriticalSection(&s_hpath_cs);
+}
+
 /* Extract the ANSI path string from an Xbox OBJECT_ATTRIBUTES */
 static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
 {
@@ -1873,6 +1968,19 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
      * field; drop them so the path compares equal to the on-disc name. */
     while (len > 0 && path_buf[len - 1] == '\0') len--;
     path_buf[len] = '\0';
+    {   /* Relative to RootDirectory: prefix the directory's own path. */
+        uint32_t root = BRIDGE_MEM32(obj_attrs_va + 0);
+        char base[260];
+        if (root && path_buf[0] != '\\' && !strchr(path_buf, ':') &&
+            hpath_get(root, base, sizeof base)) {
+            size_t bl = strlen(base);
+            char joined[520];
+            snprintf(joined, sizeof joined, "%s%s%s", base,
+                     (bl && base[bl - 1] == '\\') ? "" : "\\", path_buf);
+            strncpy(path_buf, joined, sizeof(path_buf) - 1);
+            path_buf[sizeof(path_buf) - 1] = '\0';
+        }
+    }
     return path_buf;
 }
 
@@ -2009,6 +2117,20 @@ static NTSTATUS bridge_create_file_impl(
     }
     fprintf(stderr, "  [FILE] create/open: path=\"%s\" disposition=0x%X share=0x%X\n",
             name.Buffer, disposition, share);
+    {   /* A create (not an open) of a name ending in '\' is a file name that
+         * came out empty (part 183: the save image copy). Report who built
+         * it -- host frames resolve with addr2line, image base 0x140000000. */
+        size_t nl = strlen(name.Buffer);
+        if (nl && name.Buffer[nl - 1] == '\\' && disposition != 1 && !(options & 0x1)) {
+            void *fr[16];
+            unsigned short c = (unsigned short)CaptureStackBackTrace(0, 16, fr, NULL), i;
+            uintptr_t mb = (uintptr_t)GetModuleHandleW(NULL);
+            fprintf(stderr, "  [FILE] empty file name (options 0x%X); host frames:", (unsigned)options);
+            for (i = 0; i < c; i++)
+                fprintf(stderr, " 0x%llX", (unsigned long long)(0x140000000ULL + ((uintptr_t)fr[i] - mb)));
+            fprintf(stderr, "\n");
+        }
+    }
     fflush(stderr);
     trap_nan_check_path(name.Buffer);
     memset(&ios, 0, sizeof(ios));
@@ -2022,6 +2144,7 @@ static NTSTATUS bridge_create_file_impl(
     if (NT_SUCCESS(st)) {
         file_ledger_open(h, name.Buffer);
         bridge_write_handle(handle_va, h);
+        if (handle_va) hpath_set(BRIDGE_MEM32(handle_va), name.Buffer);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
@@ -2069,7 +2192,7 @@ static void bridge_NtOpenFile(void)
  * which looks identical to success in the open log. Tracked here and exposed
  * through the diagnostics server's `files` command.
  */
-#define XBOX_FILE_LEDGER 64
+#define XBOX_FILE_LEDGER 256
 typedef struct {
     char     path[128];
     uint64_t bytes_read;
@@ -2085,6 +2208,11 @@ static void file_ledger_open(HANDLE h, const char *path)
     if (!h || !path) return;
     for (i = 0; i < g_files_n; i++)
         if (g_files[i].h == h) { g_files[i].h = NULL; }   /* handle reused */
+    /* Reopening a path reuses its row: the memory-unit scan opens "U:\\" dozens
+     * of times, which filled the 64-row ledger before the first menu and hid
+     * every later read (part 183). */
+    for (i = 0; i < g_files_n; i++)
+        if (!strcmp(g_files[i].path, path)) { g_files[i].h = h; return; }
     if (g_files_n >= XBOX_FILE_LEDGER) return;
     {
         xbox_file_rec *r = &g_files[g_files_n++];
@@ -2124,6 +2252,33 @@ static void bridge_NtReadFile(void)
     LARGE_INTEGER  off;
     PLARGE_INTEGER poff = NULL;
 
+    if (!buffer_va && length) {
+        /* A read into guest address 0 means the caller's buffer allocation
+         * failed and it carried on (part 183: the fourth outfit in Customize
+         * Outfit froze the frontend this way). Always reported, with the
+         * host frames (addr2line, image base 0x140000000) and the guest code
+         * addresses on the stack. */
+        static int shown = 0;
+        if (shown++ < 8) {
+            extern volatile unsigned g_last_loc;
+            void *fr[16];
+            unsigned short c = (unsigned short)CaptureStackBackTrace(0, 16, fr, NULL), i;
+            uintptr_t mb = (uintptr_t)GetModuleHandleW(NULL);
+            fprintf(stderr, "[READ] NULL buffer: h=%p len=%u after loc_%08X; host frames:",
+                    handle, length, (unsigned)g_last_loc);
+            for (i = 0; i < c; i++)
+                fprintf(stderr, " 0x%llX",
+                        (unsigned long long)(0x140000000ULL + ((uintptr_t)fr[i] - mb)));
+            fprintf(stderr, "\n         guest stack code refs:");
+            for (i = 8; i < 72; i++) {
+                uint32_t v = BRIDGE_MEM32(g_esp + i * 4);
+                if (v >= 0x00011000u && v < 0x00190000u)
+                    fprintf(stderr, " [esp+0x%X]=0x%08X", i * 4, v);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
     memset(&ios, 0, sizeof(ios));
     if (offset_va) {
         off.LowPart  = BRIDGE_MEM32(offset_va);
@@ -2140,8 +2295,15 @@ static void bridge_NtReadFile(void)
         LARGE_INTEGER a, b;
         if (stats < 0) { const char *e = getenv("XBOX_READ_STATS"); stats = e && e[0] == '1'; }
         if (stats) { if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a); }
-        g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
-                    XBOX_TO_NATIVE(buffer_va), length, poff);
+        {
+            /* A diag write-watch on the destination would make ReadFile fail
+             * with ERROR_NOACCESS; lift it for the read (xbox_diag.c). */
+            extern int xbox_diag_watch_host_write(uint32_t va, uint32_t len, int begin);
+            int wl = xbox_diag_watch_host_write(buffer_va, length, 1);
+            g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                        XBOX_TO_NATIVE(buffer_va), length, poff);
+            if (wl) xbox_diag_watch_host_write(buffer_va, length, 0);
+        }
         if (stats) {
             double t;
             QueryPerformanceCounter(&b);
@@ -3424,7 +3586,7 @@ static void bridge_MmQueryAllocationSize(void)        /* 180, 1 arg */
      * value during DirectSoundCreate, so an 87 MB "buffer" came back as
      * E_OUTOFMEMORY three times at boot, and its freed-bytes counter went
      * negative. The heap ledger has the real extent. See RE_NOTES part 177. */
-    uint32_t va = STACK_ARG(0), base = 0, size = 0;
+    uint32_t va = xbox_fold_ram_alias(STACK_ARG(0)), base = 0, size = 0;
     if (va && xbox_heap_owner_of(va, &base, &size, NULL, NULL, 0, NULL))
         g_eax = (size + 0xFFFu) & ~0xFFFu;
     else

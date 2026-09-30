@@ -14,6 +14,12 @@ run while someone is playing.
 Environment: FROM (560), EVERY (40), COUNT (30), NOKILL=1 to leave other test
 instances running (parallel runs). The log goes to OUTDIR/run.log.
 
+A run that dumps no frame at all has usually hung (about one boot in a dozen
+stalls before the title screen, part 183). The diag server is on (DIAGPORT,
+default 7650), and on such a run `loc` and `threads` are saved to
+OUTDIR/hang.txt before the process is killed, so the hang can be examined
+instead of just rerun.
+
 Frame numbers drift between runs: the presses are timed in seconds, so how
 far a given frame is into the race depends on load speed. Compare by content
 (xemucompare.py) or by the race clock, not by frame number.
@@ -22,6 +28,11 @@ import glob
 import os
 import subprocess
 import sys
+
+try:
+    import xbdiag
+except ImportError:
+    xbdiag = None
 
 import ssxpaths
 import stale
@@ -40,7 +51,8 @@ def main():
                XBOX_D3D_DUMP=os.path.join(out, "f"),
                XBOX_D3D_DUMP_FROM=os.environ.get("FROM", "560"),
                XBOX_D3D_DUMP_EVERY=os.environ.get("EVERY", "40"),
-               XBOX_D3D_DUMP_MAX=os.environ.get("COUNT", "30"))
+               XBOX_D3D_DUMP_MAX=os.environ.get("COUNT", "30"),
+               XBOX_DIAG_PORT=os.environ.get("DIAGPORT", "7650"))
     if not os.environ.get("NOKILL"):
         stale.kill_test_instances()
     with open(os.path.join(out, "run.log"), "wb") as log:
@@ -49,6 +61,16 @@ def main():
         try:
             p.wait(timeout=secs)
         except subprocess.TimeoutExpired:
+            if (xbdiag and not glob.glob(os.path.join(out, "*.bmp"))
+                    and int(env.get("XBOX_D3D_DUMP_MAX", "1") or 0) > 0):
+                with open(os.path.join(out, "hang.txt"), "w") as h:
+                    for cmd in ("loc", "threads"):
+                        try:
+                            h.write("> %s\n%s\n" % (cmd, xbdiag.send(
+                                int(env["XBOX_DIAG_PORT"]), cmd, timeout=10)))
+                        except Exception as e:  # noqa: BLE001 -- best effort
+                            h.write("> %s failed: %s\n" % (cmd, e))
+                print("no frames: loc/threads saved to hang.txt")
             p.kill()
             p.wait()
     print(len(glob.glob(os.path.join(out, "*.bmp"))), "frames")
